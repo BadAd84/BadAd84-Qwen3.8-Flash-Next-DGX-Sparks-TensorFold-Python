@@ -207,7 +207,7 @@ class App:
         """``self.tok.encode(text, add_special_tokens=special).ids``, the same ids, through the batch call: it tokenizes
         with Python's GIL released (``encode`` holds it: ~0.36 s at a 256k-token prompt stopped the engine loop and
         every other stream) and skips the character offsets nothing here reads (~30% faster). OTS tokenize-nogil, as
-        GLM's patch 0082; ots-infra scripts/glm53/v18/tok_gil.py."""
+        GLM's patch 0082; glm5.3-flash-dev scripts/glm53/v18/tok_gil.py."""
 
         return self.tok.encode_batch_fast([text], add_special_tokens=special)[0].ids
 
