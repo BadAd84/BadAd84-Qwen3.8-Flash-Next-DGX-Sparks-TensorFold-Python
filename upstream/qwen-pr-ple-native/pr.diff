@@ -1,0 +1,418 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aa748de..42e6cf1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,13 @@ release ends at is given, and the prebuilt images are
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- Prefill with the n-gram tables on SSD (patch `0014-flash-next-ple-native-reads`): the table reads run in
++  native threads with Python's GIL released, the same files, offsets and bytes. One gather of 16,384 ids,
++  warm: 232 -> 9.5 ms. Prefill at 8k / 32k / 128k tokens: 1,735 / 2,354 / 2,230 -> 2,547 / 2,637 / 2,297
++  tok/s; decode unchanged; replies byte-identical. Needs 0013.
++
+ ## [0.6.0] - 2026-10-02
+ 
+ Commit `22a3010` (#13). Images unchanged from 0.5.0.
+diff --git a/CREDITS.md b/CREDITS.md
+index fcdda76..284063f 100644
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -44,6 +44,7 @@ This repository is a thin layer of scripts and patches. Almost everything that m
+   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
+   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
+   built from each language's Wikipedia by token frequency.
++- `0014-flash-next-ple-native-reads` (the n-gram reads in native threads): by [BadAd84](https://github.com/BadAd84).
+ 
+ ## Runtime stack
+ 
+@@ -52,7 +53,7 @@ This repository is a thin layer of scripts and patches. Almost everything that m
+   libraries. Governed by the NVIDIA Software License Agreement and the Product-Specific Terms for NVIDIA AI Products;
+   see the README's License section.
+ - **[PyTorch](https://pytorch.org/)** (BSD-3-Clause): tensors, CUDA streams and the C++ extension builder that compiles
+-  the native n-gram reader in patch 0003.
++  the native n-gram reader in patch 0014.
+ - **[Triton](https://github.com/triton-lang/triton)** (MIT): the language most of TensorFold's Flash Next CUDA kernels,
+   and TensorFold's tiled attention-block select, are written in.
+ - **[NumPy](https://numpy.org/)** (BSD-3-Clause): the host-side n-gram lookups and read planning, and video patches.
+diff --git a/README.md b/README.md
+index d32947c..9dac5a5 100644
+--- a/README.md
++++ b/README.md
+@@ -325,6 +325,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
+ | Patch | Change |
+ | --- | --- |
+ | `0002-flash-next-v061` | Flash Next on v0.6.1: video input and up to 50 images sharing 16,384 tokens on top of TensorFold's own Flash Next image input (which came from this recipe's v0.6.0 vision patch), copy drafts with compact MTP rows, a `TENSORFOLD_PREFILL_ROWS` override, SSD read-ahead around the n-gram table, first token before the next draft, no unused MTP logits while prompts absorb, 96 MiB request bodies. Percentage effects in older notes were measured on v0.5.0, not on this pin. |
++| `0014-flash-next-ple-native-reads` | With `PLE_ON_SSD=1`: every n-gram table read runs in native threads with Python's GIL released (a small C++ reader built once with `load_inline` into the kernel cache; the same files, offsets and bytes, the rows taken in the same order). `TENSORFOLD_PLE_NATIVE=0` restores the Python reads, which are also the fallback, with a line on stderr, when the reader cannot build. Needs 0013 |
+ | `languages/0010-flash-next-draft-languages` | Opt-in language image only (`DRAFT_LANGUAGE`): language draft vocabularies for the MTP head. |
+ 
+ v0.6.1 brings, upstream: shared system prompts copied into a free stream instead of filled again (measured here: a 31k-token system prompt answered a new question in 0.18 s instead of 14 s), forks that resume from the shared prefix, short prompts admitted while a long one fills, `--vision-max-images`, vLLM-named `/metrics`, and the fix for a refused request breaking the next one on its connection. Its startup reserve is `TENSORFOLD_MEMORY_RESERVE_GIB` (this recipe sets 2). Live `/health` counters, stream draft stats, and tiled QSA selection landed in v0.5.0.
+@@ -350,6 +351,7 @@ from this machine or another one (`API_URL=http://<spark-address>:8888 tools/ben
+ | `tools/needle.py` | hides a passphrase in a ~195k-token prompt and checks the model returns it |
+ | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+ | `tools/visioncheck.py` | sends a drawn image (a red circle and a blue square) and checks the model names both |
++| `tools/ple_native_check.py [dir]` | patch 0014's native reads against the memory-mapped table and the Python reads, on a small generated table, cold and warm (CPU; `dir` on a real disk, not tmpfs) |
+ 
+ ## Repository layout
+ 
+diff --git a/patches/0014-flash-next-ple-native-reads.patch b/patches/0014-flash-next-ple-native-reads.patch
+new file mode 100644
+index 0000000..29da917
+--- /dev/null
++++ b/patches/0014-flash-next-ple-native-reads.patch
+@@ -0,0 +1,157 @@
++Flash Next with --ple-on-ssd: n-gram reads in native threads with Python's GIL released (a load_inline C++ reader: the same files, offsets and bytes). TENSORFOLD_PLE_NATIVE=0 restores the Python reads.
++--- tensorfold/families/qwen4_exp/ssd_table.py
+++++ tensorfold/families/qwen4_exp/ssd_table.py
++@@ -2,6 +2,7 @@
++ 
++ from __future__ import annotations
++ 
+++import functools
++ import os
++ import struct
++ import sys
++@@ -14,6 +15,90 @@
++ WORKERS = 16                # reads in flight at once: os.pread releases the GIL
++ MAX_READ = 1 << 20          # bytes one read of adjacent rows may cover
++ NOWAIT_READS = 4096         # a gather of at most this many reads (a decode window's) does the cached ones itself first
+++# The reads in native threads (TENSORFOLD_PLE_NATIVE=0: Python's, as above): a prompt chunk's ~50k row reads went
+++# through 16 Python threads at ~9 us of GIL each; a decode window's cached reads cost ~2 us each on the engine thread.
+++NATIVE = os.environ.get("TENSORFOLD_PLE_NATIVE", "1") != "0"
+++NATIVE_PER = 512            # reads a native thread takes at least: a decode window reads on one thread (measured,
+++                            # warm: 336 reads 0.09 ms on 1 thread, 0.12 on 4; 1,470 reads 0.39 / 0.34 ms)
+++NATIVE_THREADS = 64         # threads at most: a cold prompt chunk waits on the disk, more reads in flight
+++_SOURCE = r"""
+++#include <torch/extension.h>
+++#include <atomic>
+++#include <cerrno>
+++#include <stdexcept>
+++#include <system_error>
+++#include <thread>
+++#include <vector>
+++#include <unistd.h>
+++
+++// reads [n, 4] int64 (fd, file offset, bytes, offset in out), every one read into out by `threads` threads with the
+++// GIL released, finishing short reads; end of file means the checkpoint changed.
+++void gather_reads(torch::Tensor reads, torch::Tensor out, int64_t threads) {
+++  TORCH_CHECK(reads.scalar_type() == torch::kInt64 && reads.dim() == 2 && reads.size(1) == 4 && reads.is_contiguous());
+++  TORCH_CHECK(out.scalar_type() == torch::kUInt8 && out.is_contiguous() && out.device().is_cpu());
+++  const int64_t* r = reads.data_ptr<int64_t>();
+++  uint8_t* o = out.data_ptr<uint8_t>();
+++  const int64_t n = reads.size(0), cap = out.numel();
+++  for (int64_t i = 0; i < n; ++i)
+++    TORCH_CHECK(r[4 * i + 2] >= 0 && r[4 * i + 3] >= 0 && r[4 * i + 3] + r[4 * i + 2] <= cap, "read past the buffer");
+++  std::atomic<int64_t> next{0};
+++  std::atomic<int> err{0};
+++  {
+++    pybind11::gil_scoped_release nogil;
+++    auto work = [&]() {
+++      for (;;) {
+++        const int64_t i = next.fetch_add(1);
+++        if (i >= n || err.load() != 0) return;
+++        const int fd = static_cast<int>(r[4 * i]);
+++        const int64_t off = r[4 * i + 1], size = r[4 * i + 2], at = r[4 * i + 3];
+++        int64_t done = 0;
+++        while (done < size) {
+++          const ssize_t got = pread(fd, o + at + done, size - done, off + done);
+++          if (got < 0) {
+++            if (errno == EINTR) continue;
+++            err.store(errno);
+++            return;
+++          }
+++          if (got == 0) {
+++            err.store(-1);
+++            return;
+++          }
+++          done += got;
+++        }
+++      }
+++    };
+++    const int64_t t = std::max<int64_t>(1, std::min<int64_t>(threads, n));
+++    std::vector<std::thread> pool;
+++    for (int64_t k = 1; k < t; ++k) pool.emplace_back(work);
+++    work();
+++    for (auto& th : pool) th.join();
+++  }
+++  const int e = err.load();
+++  if (e == -1) throw std::runtime_error("short read of the n-gram tables: the checkpoint changed");
+++  if (e != 0) throw std::system_error(e, std::generic_category(), "n-gram table read");
+++}
+++"""
+++
+++
+++@functools.lru_cache(maxsize=1)
+++def _native():
+++    """The native reader (built once into TORCH_EXTENSIONS_DIR), or None where it can't build: the Python reads."""
+++
+++    try:
+++        from torch.utils.cpp_extension import load_inline
+++
+++        return load_inline(name="tensorfold_ple_gather", cpp_sources=[_SOURCE], functions=["gather_reads"],
+++                           extra_cflags=["-O2"], verbose=False)
+++    except Exception as exc:                     # noqa: BLE001  (no compiler: the Python path, as before)
+++        print(f"[tensorfold] n-gram reads: native reader unavailable ({type(exc).__name__}: {exc}); Python reads",
+++              file=sys.stderr, flush=True)
+++        return None
+++
+++
+++def torch_from(a: np.ndarray):
+++    import torch
+++
+++    return torch.from_numpy(a)
++ _KINDS = (("weight", "U32", 4), ("scales", "BF16", 2), ("biases", "BF16", 2))
++ # RWF_NOWAIT: a read that would wait on the disk fails at once (TENSORFOLD_PLE_NOWAIT=0: every read to the threads)
++ _NOWAIT = getattr(os, "RWF_NOWAIT", None) \
++@@ -98,6 +183,8 @@
++         except BaseException:
++             self.close()
++             raise
+++        if NATIVE:
+++            _native()                                # built (or found) at load, not at a request's first lookup
++ 
++     def _layout(self, files: list[tuple[Path, dict, dict, dict]], nocache: bool) -> None:
++         if not files:
++@@ -150,6 +237,9 @@
++         unique, inverse = np.unique(flat.astype(np.int64), return_inverse=True)
++         shard = np.searchsorted(self.starts, unique, side="right") - 1
++         local, where = unique - self.starts[shard], self.fidx[shard]
+++        native = _native() if NATIVE else None
+++        if native is not None and unique.size:
+++            return self._gather_native(native, unique.size, inverse, shard, local, where)
++         outs, reads = [], []
++         for part, width in enumerate((self.wrow, self.grow, self.grow)):
++             outs.append(np.empty((unique.size, width), dtype=np.uint8))
++@@ -164,6 +254,35 @@
++         words, scales, biases = (out[inverse] for out in outs)
++         return words.view(np.uint32), scales.view(np.uint16), biases.view(np.uint16)
++ 
+++    def _gather_native(self, native, n: int, inverse, shard, local, where):
+++        """``gather``'s rows read by the native extension: the same reads (one a run of adjacent rows), every one in
+++        native threads without Python's GIL, into one buffer holding the words, scales and biases parts."""
+++
+++        widths = (self.wrow, self.grow, self.grow)
+++        buf = np.empty(n * sum(widths), dtype=np.uint8)
+++        parts, table, base = [], [], 0
+++        for part, width in enumerate(widths):
+++            parts.append(buf[base:base + n * width].reshape(n, width))
+++            table.append(self._runs(where, self.bases[shard, part] + local * width, width, base))
+++            base += n * width
+++        reads = np.concatenate(table)
+++        threads = min(NATIVE_THREADS, max(1, reads.shape[0] // NATIVE_PER))
+++        native.gather_reads(torch_from(reads), torch_from(buf), threads)
+++        words, scales, biases = (out[inverse] for out in parts)
+++        return words.view(np.uint32), scales.view(np.uint16), biases.view(np.uint16)
+++
+++    def _runs(self, where: np.ndarray, offsets: np.ndarray, width: int, at: int) -> np.ndarray:
+++        """``_reads``'s reads as rows (fd, file offset, bytes, offset in the buffer) of an int64 array."""
+++
+++        n = offsets.size
+++        cut = np.ones(n, dtype=bool)
+++        cut[1:] = (where[1:] != where[:-1]) | (offsets[1:] != offsets[:-1] + width)
+++        first = np.flatnonzero(cut)
+++        cut |= (np.arange(n) - first[np.cumsum(cut) - 1]) % max(1, MAX_READ // width) == 0
+++        first = np.flatnonzero(cut)
+++        rows = np.diff(first, append=n)
+++        return np.stack([self._fd_of[where[first]], offsets[first], rows * width, at + first * width], axis=1)
+++
++     def _reads(self, where: np.ndarray, offsets: np.ndarray, width: int, out: np.ndarray) -> list[tuple]:
++         """One read per run of rows adjacent in one file, each at most MAX_READ bytes, into ``out``'s rows."""
++ 
+diff --git a/tools/ple_native_check.py b/tools/ple_native_check.py
+new file mode 100644
+index 0000000..4eac41b
+--- /dev/null
++++ b/tools/ple_native_check.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python3
++"""tools/ple_native_check.py [scratch dir]: patch 0014 (--ple-on-ssd n-gram reads in native threads), CPU only, no
++model, in the image (it builds the reader with the image's compiler, about a minute the first time). The scratch dir
++must be on a real disk (ext4, xfs), not tmpfs or the container's overlay: the check writes a small n-gram table there
++(three safetensors files, ~25 MB) and drops its pages to read it cold.
++
++    mkdir -p /tmp/plecheck && docker run --rm --entrypoint python3 -v "$PWD/tools:/t:ro" -v /tmp/plecheck:/d \
++      tensorfold-qwen38:v0.6.1 /t/ple_native_check.py /d
++
++Checks: the native reader builds and every gather uses it (`TENSORFOLD_PLE_NATIVE=0` turns it off); its read table
++is the Python path's reads (the same file, offset, length and place for each run of adjacent rows, runs split at
++MAX_READ); every gather returns exactly the memory-mapped `HostTable`'s rows and the Python reads' (dtype, shape,
++bytes) for decode-sized, prompt-sized, long-run, shard-boundary and repeated id sets, cold and warm; a table file cut
++short raises instead of returning rows. Prints PASS / FAIL lines and ALL PASS; exit 1 on any FAIL.
++"""
++from __future__ import annotations
++
++import json
++import os
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++import numpy as np
++
++fails = 0
++
++
++def check(name, fn):
++    global fails
++    try:
++        ok, detail = fn()
++    except Exception as exc:                          # noqa: BLE001  (a missing or broken piece is a FAIL)
++        ok, detail = False, f"{type(exc).__name__}: {exc}"
++    print(("PASS " if ok else "FAIL ") + name + (f" ({detail})" if detail else ""), flush=True)
++    fails += not ok
++
++
++from tensorfold.families.qwen4_exp import host_table, ssd_table  # noqa: E402
++
++NAME, G = "model.layers.0.ngram_embedding", 16    # scales a row (bf16): rows of 4 x 16 words, 32 B scales and biases
++
++
++def write_table(d: Path) -> int:
++    """Three safetensors files holding six shards of random rows (the parts in differing orders), like the
++    checkpoint's MLX 4-bit n-gram table. Returns the shard count."""
++    rng = np.random.default_rng(13)
++    shards = [(0, 2000), (0, 5300), (1, 4100), (1, 700), (2, 6000), (2, 3900)]
++    for f in range(3):
++        header, blobs, at = {}, [], 0
++        for i, (fi, rows) in enumerate(shards):
++            if fi != f:
++                continue
++            parts = [("weight", "U32", 4 * G, 4), ("scales", "BF16", G, 2), ("biases", "BF16", G, 2)]
++            for part, dtype, cols, item in (parts if i % 2 else parts[::-1]):
++                data = rng.integers(0, 256, rows * cols * item, dtype=np.uint8).tobytes()
++                header[f"{NAME}.shard_{i}.{part}"] = {"dtype": dtype, "shape": [rows, cols],
++                                                      "data_offsets": [at, at + len(data)]}
++                blobs.append(data)
++                at += len(data)
++        head = json.dumps(header).encode()
++        (d / f"model-{f:05d}-of-00003.safetensors").write_bytes(struct.pack("<Q", len(head)) + head + b"".join(blobs))
++    return len(shards)
++
++
++def tables(d: Path):
++    return (host_table.from_checkpoint(d, NAME, COUNT, ssd=True), host_table.from_checkpoint(d, NAME, COUNT))
++
++
++def evict(t) -> None:
++    for fd in t._fds:
++        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++
++
++def cases(rows, starts):
++    rng = np.random.default_rng(1234)
++    bounds = np.concatenate([starts[1:-1] - 1, starts[1:-1], [0, rows - 1]])
++    return [("decode, 1 stream", rng.integers(0, rows, 112)),
++            ("decode, 4 streams with repeats", np.concatenate([rng.integers(0, rows, 400),
++                                                               rng.integers(0, rows, 30).repeat(3)])),
++            ("prompt chunk", rng.integers(0, rows, 16384)),
++            ("one id", np.array([rows // 3])),
++            ("long runs past MAX_READ", np.concatenate([np.arange(2000, 7300), np.arange(11500, rows)])),
++            ("adjacent runs", np.concatenate([np.arange(s, s + n) for s, n in zip(rng.integers(0, rows - 6000, 5),
++                                                                                (1, 2, 50, 700, 5000))])),
++            ("shard boundaries", np.concatenate([bounds, bounds[::-1]])),
++            ("unsorted repeats", rng.permutation(np.repeat(rng.integers(0, rows, 3000), 4)))]
++
++
++def same(a, b):
++    return all(x.dtype == y.dtype and x.shape == y.shape and np.array_equal(x, y) for x, y in zip(a, b))
++
++
++def engaged():
++    code = "from tensorfold.families.qwen4_exp import ssd_table as s; print(s.NATIVE)"
++    env = {k: v for k, v in os.environ.items() if k != "TENSORFOLD_PLE_NATIVE"}
++    on = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True).stdout.strip()
++    off = subprocess.run([sys.executable, "-c", code], env={**env, "TENSORFOLD_PLE_NATIVE": "0"},
++                         capture_output=True, text=True).stdout.strip()
++    built = ssd_table._native() is not None
++    ssd, _ = tables(DIR)
++    used = [0]
++    native = type(ssd)._gather_native
++
++    def counting(self, *a):
++        used[0] += 1
++        return native(self, *a)
++
++    sets = cases(ssd.rows, ssd.starts)
++    type(ssd)._gather_native = counting
++    try:
++        for _, ids in sets:
++            ssd.gather(ids)
++    finally:
++        type(ssd)._gather_native = native
++        ssd.close()
++    n = len(sets)
++    return on == "True" and off == "False" and built and used[0] == n, \
++        f"default {on}, TENSORFOLD_PLE_NATIVE=0 {off}, built {built}, {used[0]} of {n} gathers native"
++
++
++def same_reads():
++    ssd, _ = tables(DIR)
++    rng = np.random.default_rng(5)
++    bad = 0
++    for ids in [np.unique(rng.integers(0, ssd.rows, n)) for n in (1, 7, 300, 5000)] + [np.arange(0, ssd.rows)]:
++        shard = np.searchsorted(ssd.starts, ids, side="right") - 1
++        local, where = ids - ssd.starts[shard], ssd.fidx[shard]
++        for part, width in enumerate((ssd.wrow, ssd.grow, ssd.grow)):
++            offsets = ssd.bases[shard, part] + local * width
++            out = np.empty((ids.size, width), dtype=np.uint8)
++            py = [(fd, off, size, at) for fd, off, size, _, at in ssd._reads(where, offsets, width, out)]
++            nat = [tuple(int(v) for v in r) for r in ssd._runs(where, offsets, width, 0)]
++            bad += py != nat
++    ssd.close()
++    return not bad, f"{bad} read tables differ"
++
++
++def rows_match():
++    ssd, host = tables(DIR)
++    bad, n = [], 0
++    for cold in (True, False):
++        for name, ids in cases(ssd.rows, ssd.starts):
++            if cold:
++                evict(ssd)
++            got = ssd.gather(ids)
++            ssd_table.NATIVE = False
++            if cold:
++                evict(ssd)
++            py = ssd.gather(ids)
++            ssd_table.NATIVE = True
++            n += 1
++            if not (same(got, host.gather(ids)) and same(got, py)):
++                bad.append(f"{'cold' if cold else 'warm'} {name}")
++    ssd.close()
++    return not bad, f"{n} gathers, native = memory map = Python reads" + (f", DIFFER: {bad}" if bad else "")
++
++
++def short_file():
++    import shutil
++    cut = DIR / "cut"
++    cut.mkdir()
++    for f in DIR.glob("*.safetensors"):
++        shutil.copy(f, cut / f.name)
++    ssd = host_table.from_checkpoint(cut, NAME, COUNT, ssd=True)
++    last = cut / "model-00002-of-00003.safetensors"
++    os.truncate(last, last.stat().st_size - 50_000)
++    try:
++        ssd.gather(np.array([ssd.rows - 1]))
++        raised = "nothing"
++    except (RuntimeError, OSError) as exc:
++        raised = type(exc).__name__
++    ssd.close()
++    shutil.rmtree(cut)
++    return raised != "nothing", f"a read past the cut raised {raised}"
++
++
++DIR = Path(tempfile.mkdtemp(prefix="plecheck-", dir=sys.argv[1] if len(sys.argv) > 1 else None))
++COUNT = write_table(DIR)
++check("the native reader builds and every gather uses it; TENSORFOLD_PLE_NATIVE=0 turns it off", engaged)
++check("its reads are the Python path's: file, offset, length and place for each run", same_reads)
++check("gathers return the memory-mapped table's rows and the Python reads', cold and warm", rows_match)
++check("a table file cut short raises instead of returning rows", short_file)
++for f in DIR.iterdir():
++    f.unlink()
++DIR.rmdir()
++print("ALL PASS" if not fails else f"{fails} FAIL", flush=True)
++sys.exit(1 if fails else 0)

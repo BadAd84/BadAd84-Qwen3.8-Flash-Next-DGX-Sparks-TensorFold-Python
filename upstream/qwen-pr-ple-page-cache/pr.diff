@@ -1,0 +1,519 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aa748de..24efa7b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,14 @@ release ends at is given, and the prebuilt images are
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- Decode with the n-gram tables on SSD (patch `0013-flash-next-ple-page-cache`): a round's cached n-gram reads
++  happen on the engine thread instead of through 16 worker threads (each read cost ~9 us of thread handoff
++  against ~0.4 us for the read), and the next round's rows are hinted to the page cache while the GPU drafts.
++  Per request: prose 66.2 / 45.6 / 28.4 -> 73.9 / 50.1 / 31.9 tok/s at 1 / 2 / 4 streams, code 77.7 / 58.8 /
++  36.9 -> 85.1 / 64.0 / 41.0 (+9 to +12%); replies byte-identical. Needs 0012.
++
+ ## [0.6.0] - 2026-10-02
+ 
+ Commit `22a3010` (#13). Images unchanged from 0.5.0.
+diff --git a/CREDITS.md b/CREDITS.md
+index fcdda76..60d85b6 100644
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -44,6 +44,7 @@ This repository is a thin layer of scripts and patches. Almost everything that m
+   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
+   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
+   built from each language's Wikipedia by token frequency.
++- `0013-flash-next-ple-page-cache` (n-gram reads from the page cache, and read hints): by [BadAd84](https://github.com/BadAd84).
+ 
+ ## Runtime stack
+ 
+diff --git a/README.md b/README.md
+index d32947c..5149160 100644
+--- a/README.md
++++ b/README.md
+@@ -325,6 +325,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
+ | Patch | Change |
+ | --- | --- |
+ | `0002-flash-next-v061` | Flash Next on v0.6.1: video input and up to 50 images sharing 16,384 tokens on top of TensorFold's own Flash Next image input (which came from this recipe's v0.6.0 vision patch), copy drafts with compact MTP rows, a `TENSORFOLD_PREFILL_ROWS` override, SSD read-ahead around the n-gram table, first token before the next draft, no unused MTP logits while prompts absorb, 96 MiB request bodies. Percentage effects in older notes were measured on v0.5.0, not on this pin. |
++| `0013-flash-next-ple-page-cache` | With `PLE_ON_SSD=1`: a decode round's n-gram reads that the page cache holds are done on the engine thread (`RWF_NOWAIT`) instead of through 16 worker threads, and the next round's rows are hinted (`POSIX_FADV_WILLNEED`) on one thread while the GPU drafts. The same bytes either way. `TENSORFOLD_PLE_NOWAIT=0` and `TENSORFOLD_PLE_HINTS=0` turn them off. Needs 0012 |
+ | `languages/0010-flash-next-draft-languages` | Opt-in language image only (`DRAFT_LANGUAGE`): language draft vocabularies for the MTP head. |
+ 
+ v0.6.1 brings, upstream: shared system prompts copied into a free stream instead of filled again (measured here: a 31k-token system prompt answered a new question in 0.18 s instead of 14 s), forks that resume from the shared prefix, short prompts admitted while a long one fills, `--vision-max-images`, vLLM-named `/metrics`, and the fix for a refused request breaking the next one on its connection. Its startup reserve is `TENSORFOLD_MEMORY_RESERVE_GIB` (this recipe sets 2). Live `/health` counters, stream draft stats, and tiled QSA selection landed in v0.5.0.
+@@ -350,6 +351,7 @@ from this machine or another one (`API_URL=http://<spark-address>:8888 tools/ben
+ | `tools/needle.py` | hides a passphrase in a ~195k-token prompt and checks the model returns it |
+ | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+ | `tools/visioncheck.py` | sends a drawn image (a red circle and a blue square) and checks the model names both |
++| `tools/ple_cache_check.py [dir]` | patch 0013's reads and hints against the memory-mapped table, on a small generated table, cold and warm (CPU; `dir` on a real disk, not tmpfs) |
+ 
+ ## Repository layout
+ 
+diff --git a/patches/0013-flash-next-ple-page-cache.patch b/patches/0013-flash-next-ple-page-cache.patch
+new file mode 100644
+index 0000000..13e125c
+--- /dev/null
++++ b/patches/0013-flash-next-ple-page-cache.patch
+@@ -0,0 +1,171 @@
++Flash Next with --ple-on-ssd: n-gram lookups from the page cache. A decode gather does its cached reads on the calling thread (RWF_NOWAIT), and the next round's rows are hinted (POSIX_FADV_WILLNEED) while the GPU drafts. TENSORFOLD_PLE_NOWAIT=0 and TENSORFOLD_PLE_HINTS=0 turn them off.
++--- tensorfold/families/qwen4_exp/cuda/multi.py
+++++ tensorfold/families/qwen4_exp/cuda/multi.py
++@@ -4,6 +4,7 @@
++ 
++ import os
++ import time
+++from concurrent.futures import ThreadPoolExecutor
++ 
++ import numpy as np
++ import torch
++@@ -33,6 +34,28 @@
++ PASS_MIN = 128                   # the fewest prompt rows a round's pass takes
++ COPY_MATCH = 8                   # copy drafts: the context's last this many tokens seen before, and as many after them
++ FILL_GUARD = 8                   # a prompt passed over this many passes takes the next one (no starvation), as on Macs
+++HINTS = os.environ.get("TENSORFOLD_PLE_HINTS", "1") != "0"   # the next round's n-gram rows read while the GPU drafts
+++
+++
+++def _hinted(w) -> bool:
+++    """Whether any layer's n-gram table reads from disk at each lookup and takes page hints (--ple-on-ssd)."""
+++
+++    return HINTS and getattr(w, "x3", None) is None and any(
+++        getattr(getattr(layer.ple, "table", None), "will_need", None) is not None
+++        for layer in w.layers if layer.ple is not None)
+++
+++
+++def _will_need(w, rows: list) -> None:
+++    """Start the page reads of the n-gram rows a coming ``stage`` looks up: (history, tokens, last) each, the rows of
+++    the ``last`` final tokens after ``history`` (hints: ``stage`` reads the same bytes whether or not they ran)."""
+++
+++    for layer in w.layers:
+++        ple = layer.ple
+++        hint = getattr(getattr(ple, "table", None), "will_need", None) if ple is not None else None
+++        if hint is None:
+++            continue
+++        for history, tokens, last in rows:
+++            hint(ple.ngram.ids(history, np.asarray(tokens, dtype=np.int64))[-last:])
++ 
++ 
++ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int) -> Engine:
++@@ -89,6 +112,9 @@
++         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
++         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
++         self.keep = keep
+++        # the next round's n-gram rows (its first token, then each draft) start reading on this thread as they are
+++        # known, so the round's stage finds their pages cached; None: tables in memory, or hints off
+++        self.hints = ThreadPoolExecutor(1, thread_name_prefix="ple-hint") if _hinted(w) else None
++ 
++     def _busy(self) -> set[int]:
++         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
++@@ -547,6 +573,7 @@
++         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
++             st.set_mtp_len(st.mtp_len + len(keep))
++             s.drafts = s.copies.propose(s.context, s.count - len(s.out)) if s.copies is not None else []
+++        self._hint([(s, 1 + len(s.drafts)) for s, _, _ in todo])      # while the GPU absorbs: rows 0 and the copies
++         chains = [i for i, (s, _, _) in enumerate(todo) if not s.drafts]
++         if not chains:
++             return
++@@ -555,23 +582,35 @@
++         active = [(todo[i][0], segs[i][2] - 1) for i in chains]
++         for j in range(self.depth):
++             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
++-            nxt = []
+++            nxt, added = [], []
++             for (s, row), (d, p) in zip(active, picks):
++                 low = self.confidence > 0 and p < self.confidence
++                 if low and j > 0:
++                     continue
++                 s.drafts.append(d)
+++                added.append((s, 1))
++                 if not low and j + 1 < room[s.sid]:
++                     nxt.append((s, row, d))
++             if not nxt:
+++                self._hint(added)
++                 return
++             windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
++             segs = mtp_stage(self.w, self.mbuf, windows)
++             logits = self._mtp(segs)
+++            self._hint(added)                                # while the GPU runs the next step
++             for s, _, _ in nxt:
++                 s.st.set_mtp_len(s.st.mtp_len + 1)
++                 s.st.mtp_drafted += 1
++             active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
+++
+++    def _hint(self, rows: list) -> None:
+++        """Start the page reads of each (stream, last) pair's next-round rows: its window so far, the ``last`` final
+++        rows (on the hint thread; the stage reads the same bytes either way)."""
+++
+++        if self.hints is not None and rows:
+++            self.hints.submit(_will_need, self.w,
+++                              [(s.st.ple_history, [s.out[-1], *s.drafts], last) for s, last in rows
+++                               if s.st.ple_history is not None])
++ 
++     def _mtp(self, segs: list) -> torch.Tensor:
++         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
++--- tensorfold/families/qwen4_exp/ssd_table.py
+++++ tensorfold/families/qwen4_exp/ssd_table.py
++@@ -13,7 +13,11 @@
++ 
++ WORKERS = 16                # reads in flight at once: os.pread releases the GIL
++ MAX_READ = 1 << 20          # bytes one read of adjacent rows may cover
+++NOWAIT_READS = 4096         # a gather of at most this many reads (a decode window's) does the cached ones itself first
++ _KINDS = (("weight", "U32", 4), ("scales", "BF16", 2), ("biases", "BF16", 2))
+++# RWF_NOWAIT: a read that would wait on the disk fails at once (TENSORFOLD_PLE_NOWAIT=0: every read to the threads)
+++_NOWAIT = getattr(os, "RWF_NOWAIT", None) \
+++    if hasattr(os, "preadv") and os.environ.get("TENSORFOLD_PLE_NOWAIT", "1") != "0" else None
++ 
++ 
++ def _no_cache(fd: int) -> None:
++@@ -59,6 +63,27 @@
++                 raise OSError(f"short read of the n-gram tables at byte {offset + done}: the checkpoint changed")
++             out[at + done:at + done + len(data)] = data
++             done += len(data)
+++
+++
+++def _cached(reads: list[tuple[int, int, int, memoryview, int]]) -> list[tuple[int, int, int, memoryview, int]]:
+++    """Do each read here where the page cache holds it (RWF_NOWAIT); returns the reads, or their rests, still to do.
+++
+++    A cached read costs about a microsecond on this thread, against tens of microseconds of handing it to a worker
+++    thread; the bytes are the file's either way."""
+++
+++    global _NOWAIT
+++    left = []
+++    for i, (fd, offset, size, out, at) in enumerate(reads):
+++        try:
+++            done = os.preadv(fd, [out[at:at + size]], offset, _NOWAIT)
+++        except BlockingIOError:                  # not cached: a worker reads it
+++            done = 0
+++        except OSError:                          # the file system refuses RWF_NOWAIT: the threads read, as before
+++            _NOWAIT = None
+++            return left + reads[i:]
+++        if done < size:
+++            left.append((fd, offset + done, size - done, out, at + done))
+++    return left
++ 
++ 
++ class SSDTable:
++@@ -129,6 +154,8 @@
++         for part, width in enumerate((self.wrow, self.grow, self.grow)):
++             outs.append(np.empty((unique.size, width), dtype=np.uint8))
++             reads += self._reads(where, self.bases[shard, part] + local * width, width, outs[-1])
+++        if _NOWAIT is not None and len(reads) <= NOWAIT_READS:
+++            reads = _cached(reads)
++         batches = min(WORKERS, len(reads))
++         if batches > 1:
++             list(self._pool.map(_fill, [reads[i::batches] for i in range(batches)]))
++@@ -153,6 +180,24 @@
++         return list(zip(self._fd_of[where[first]].tolist(), offsets[first].tolist(), (rows * width).tolist(),
++                         [view] * first.size, (first * width).tolist()))
++ 
+++    def will_need(self, ids: np.ndarray) -> None:
+++        """Start reading rows ``ids`` into the page cache (POSIX_FADV_WILLNEED) and return: a later gather of them
+++        finds them cached. A hint: it changes no bytes and ignores ids it can't place."""
+++
+++        if not self._closer.alive or not hasattr(os, "posix_fadvise"):
+++            return
+++        flat = np.unique(np.asarray(ids, dtype=np.int64).reshape(-1))
+++        if not flat.size or flat[0] < 0 or flat[-1] >= self.rows:
+++            return
+++        shard = np.searchsorted(self.starts, flat, side="right") - 1
+++        local, fds = flat - self.starts[shard], self._fd_of[self.fidx[shard]].tolist()
+++        try:
+++            for part, width in enumerate((self.wrow, self.grow, self.grow)):
+++                for fd, offset in zip(fds, (self.bases[shard, part] + local * width).tolist()):
+++                    os.posix_fadvise(fd, offset, width, os.POSIX_FADV_WILLNEED)
+++        except OSError:                              # closed meanwhile: nothing to warm
+++            pass
+++
++     def prefetch(self, workers: int = 8) -> float:
++         """Nothing to warm: rows are read at each lookup, so this reads nothing (0 seconds)."""
++ 
+diff --git a/tools/ple_cache_check.py b/tools/ple_cache_check.py
+new file mode 100644
+index 0000000..f25fb21
+--- /dev/null
++++ b/tools/ple_cache_check.py
+@@ -0,0 +1,285 @@
++#!/usr/bin/env python3
++"""tools/ple_cache_check.py [scratch dir]: patch 0013 (--ple-on-ssd n-gram lookups from the page cache), CPU only,
++no model, in the image. The scratch dir must be on a real disk (ext4, xfs), not tmpfs or the container's overlay: the
++check writes a small n-gram table there (three safetensors files, ~25 MB) and drops its pages to read it cold.
++
++    mkdir -p /tmp/plecheck && docker run --rm --entrypoint python3 -v "$PWD/tools:/t:ro" -v /tmp/plecheck:/d \
++      tensorfold-qwen38:v0.6.1 /t/ple_cache_check.py /d
++
++Checks: `SSDTable.gather` returns exactly the memory-mapped `HostTable`'s rows (dtype, shape, bytes) for decode-sized,
++prompt-sized, adjacent-run, shard-boundary and repeated id sets, cold and warm; a warm decode gather reads on the
++calling thread (no read goes to the worker threads) and a cold one hands its misses over; a partly cached read keeps
++what it read and hands over the rest; `TENSORFOLD_PLE_NOWAIT=0` sends every read to the threads; `will_need` advises
++exactly each row's three parts and nothing for ids it can't place; and `MultiDecoder._draft_all`, driven with fake MTP
++steps, hints every row the next round's stage looks up (its first token, the copies, each draft) and no other.
++With patch 0014 applied as well, the gathers checked are its Python fallback (as with `TENSORFOLD_PLE_NATIVE=0`).
++Prints PASS / FAIL lines and ALL PASS; exit 1 on any FAIL.
++"""
++from __future__ import annotations
++
++import json
++import os
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++from types import SimpleNamespace as NS
++
++import numpy as np
++
++fails = 0
++
++
++def check(name, fn):
++    global fails
++    try:
++        ok, detail = fn()
++    except Exception as exc:                          # noqa: BLE001  (a missing or broken piece is a FAIL)
++        ok, detail = False, f"{type(exc).__name__}: {exc}"
++    print(("PASS " if ok else "FAIL ") + name + (f" ({detail})" if detail else ""), flush=True)
++    fails += not ok
++
++
++from tensorfold.families.qwen4_exp import host_table, ssd_table  # noqa: E402
++
++ssd_table.NATIVE = False      # with patch 0014 too: these are the Python reads it falls back to (TENSORFOLD_PLE_NATIVE=0)
++
++NAME, G = "model.layers.0.ngram_embedding", 16    # scales a row (bf16): rows of 4 x 16 words, 32 B scales and biases
++
++
++def write_table(d: Path) -> int:
++    """Three safetensors files holding six shards of random rows (the parts in differing orders), like the
++    checkpoint's MLX 4-bit n-gram table. Returns the shard count."""
++    rng = np.random.default_rng(13)
++    shards = [(0, 2000), (0, 5300), (1, 4100), (1, 700), (2, 6000), (2, 3900)]
++    for f in range(3):
++        header, blobs, at = {}, [], 0
++        for i, (fi, rows) in enumerate(shards):
++            if fi != f:
++                continue
++            parts = [("weight", "U32", 4 * G, 4), ("scales", "BF16", G, 2), ("biases", "BF16", G, 2)]
++            for part, dtype, cols, item in (parts if i % 2 else parts[::-1]):
++                data = rng.integers(0, 256, rows * cols * item, dtype=np.uint8).tobytes()
++                header[f"{NAME}.shard_{i}.{part}"] = {"dtype": dtype, "shape": [rows, cols],
++                                                      "data_offsets": [at, at + len(data)]}
++                blobs.append(data)
++                at += len(data)
++        head = json.dumps(header).encode()
++        (d / f"model-{f:05d}-of-00003.safetensors").write_bytes(struct.pack("<Q", len(head)) + head + b"".join(blobs))
++    return len(shards)
++
++
++def tables(d: Path):
++    return (host_table.from_checkpoint(d, NAME, COUNT, ssd=True), host_table.from_checkpoint(d, NAME, COUNT))
++
++
++def evict(t) -> None:
++    for fd in t._fds:
++        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++
++
++def cases(rows, starts):
++    rng = np.random.default_rng(1234)
++    bounds = np.concatenate([starts[1:-1] - 1, starts[1:-1], [0, rows - 1]])
++    return [("decode, 1 stream", rng.integers(0, rows, 112)),
++            ("decode, 4 streams with repeats", np.concatenate([rng.integers(0, rows, 400),
++                                                               rng.integers(0, rows, 30).repeat(3)])),
++            ("prompt chunk", rng.integers(0, rows, 16384)),
++            ("adjacent runs", np.concatenate([np.arange(s, s + n) for s, n in zip(rng.integers(0, rows - 6000, 5),
++                                                                                (1, 2, 50, 700, 5000))])),
++            ("shard boundaries", np.concatenate([bounds, bounds[::-1]])),
++            ("unsorted repeats", rng.permutation(np.repeat(rng.integers(0, rows, 3000), 4)))]
++
++
++def same(a, b):
++    return all(x.dtype == y.dtype and x.shape == y.shape and np.array_equal(x, y) for x, y in zip(a, b))
++
++
++def rows_match():
++    ssd, host = tables(DIR)
++    bad, n = [], 0
++    for cold in (True, False):
++        for name, ids in cases(ssd.rows, ssd.starts):
++            if cold:
++                evict(ssd)
++            n += 1
++            if not same(ssd.gather(ids), host.gather(ids)):
++                bad.append(f"{'cold' if cold else 'warm'} {name}")
++    ssd.close()
++    return not bad, f"{n} gathers" + (f", DIFFER: {bad}" if bad else "")
++
++
++class Counted:
++    """The worker threads' reads, counted (the table's pool.map, wrapped)."""
++
++    def __init__(self, t):
++        self.reads, self.pool = 0, t._pool
++        t._pool = self
++
++    def map(self, fn, batches):
++        batches = list(batches)
++        self.reads += sum(len(b) for b in batches)
++        return self.pool.map(fn, batches)
++
++
++def threads_only_for_misses():
++    ssd, host = tables(DIR)
++    ids = np.random.default_rng(7).integers(0, ssd.rows, 112)
++    counted = Counted(ssd)
++    evict(ssd)
++    cold_ok = same(ssd.gather(ids), host.gather(ids))
++    cold = counted.reads
++    counted.reads = 0
++    warm_ok = same(ssd.gather(ids), host.gather(ids))
++    warm = counted.reads
++    big = np.arange(0, ssd.rows, 3)[:5000]             # 15,000 reads: more than a decode window's, all to the threads
++    counted.reads = 0
++    ssd.gather(big)
++    ssd.gather(big)
++    ssd.close()
++    return cold_ok and warm_ok and cold > 0 and warm == 0 and counted.reads >= 2 * 3 * 4096, \
++        f"reads on the worker threads: cold {cold}, warm {warm}, a 15,000-read gather twice {counted.reads}"
++
++
++def partial():
++    """A read of 64 adjacent rows whose first page alone is cached: the cached part is read here, the rest handed on."""
++    ssd, _ = tables(DIR)
++    fd = ssd._fds[0]
++    offset = int(ssd.bases[0, 0]) + 4096 * 4 - int(ssd.bases[0, 0]) % 4096    # page-aligned, inside shard 0's words
++    size = 64 * 4 * G * 4
++    want = os.pread(fd, size, offset)
++    seen = []
++    for warm in (4096, 8192, 0, size):
++        evict(ssd)
++        if warm:
++            os.pread(fd, warm, offset)
++        buf = bytearray(size)
++        rest = ssd_table._cached([(fd, offset, size, memoryview(buf), 0)])
++        done = size - sum(r[2] for r in rest)
++        for r_fd, r_off, r_size, r_out, r_at in rest:          # what the threads would do
++            r_out[r_at:r_at + r_size] = os.pread(r_fd, r_size, r_off)
++        seen.append((warm, done, bytes(buf) == want, all(r_off - offset == r_at for _, r_off, _, _, r_at in rest)))
++    ssd.close()
++    parts = [s for s in seen if 0 < s[1] < size]
++    ok = all(s[2] and s[3] for s in seen) and seen[-1][1] == size and seen[2][1] == 0 and parts
++    return ok, f"(cached bytes, read here, bytes right, rest placed right): {seen}"
++
++
++def nowait_switch():
++    code = "from tensorfold.families.qwen4_exp import ssd_table as s; print(s._NOWAIT is not None)"
++    env = {k: v for k, v in os.environ.items() if k != "TENSORFOLD_PLE_NOWAIT"}
++    on = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True).stdout.strip()
++    off = subprocess.run([sys.executable, "-c", code], env={**env, "TENSORFOLD_PLE_NOWAIT": "0"},
++                         capture_output=True, text=True).stdout.strip()
++    return on == "True" and off == "False", f"default {on}, TENSORFOLD_PLE_NOWAIT=0 {off}"
++
++
++def will_need():
++    ssd, _ = tables(DIR)
++    calls = []
++    real = os.posix_fadvise
++    os.posix_fadvise = lambda fd, off, n, how: calls.append((fd, off, n, how))
++    try:
++        ids = np.array([[5, 5, 2001], [ssd.rows - 1, 7300, 5]])
++        ssd.will_need(ids)
++        got = sorted(calls)
++        want = []
++        for g in sorted({5, 2001, ssd.rows - 1, 7300}):
++            shard = int(np.searchsorted(ssd.starts, g, side="right") - 1)
++            local, fd = g - int(ssd.starts[shard]), int(ssd._fd_of[ssd.fidx[shard]])
++            for part, width in enumerate((ssd.wrow, ssd.grow, ssd.grow)):
++                want.append((fd, int(ssd.bases[shard, part]) + local * width, width, os.POSIX_FADV_WILLNEED))
++        calls.clear()
++        ssd.will_need(np.array([3, ssd.rows]))          # an id past the table: nothing
++        ssd.will_need(np.array([-1, 4]))
++        outside = len(calls)
++        ssd.close()
++        ssd.will_need(np.array([3]))                    # closed: nothing
++        closed = len(calls) - outside
++    finally:
++        os.posix_fadvise = real
++    return got == sorted(want) and outside == 0 and closed == 0, \
++        f"{len(got)} advices for 4 rows (want {len(want)}), {outside} outside the table, {closed} once closed"
++
++
++class State:
++    def __init__(self, pos, history):
++        self.pos, self.mtp_len, self.mtp_drafted, self.ple_history = pos, pos, 0, history
++
++    def set_mtp_len(self, n):
++        self.mtp_len = n
++
++
++class Rows(list):
++    def __getitem__(self, i):
++        return Rows(list.__getitem__(self, k) for k in i) if isinstance(i, list) else list.__getitem__(self, i)
++
++
++def ngram_ids(history, tokens):
++    """A fake n-gram lookup: each token's row depends on the history and every token before it, as the real one."""
++    out, h = [], int(history[0])
++    for t in tokens:
++        h = (h * 1_000_003 + int(t)) % 999_983
++        out.append([h, h + 1])
++    return np.asarray(out, dtype=np.int64)
++
++
++def hints():
++    from tensorfold.families.qwen4_exp.cuda import multi as m
++
++    seen = []
++    table = NS(will_need=lambda ids: seen.append(np.asarray(ids).reshape(-1, 2)))
++    w = NS(x3=None, layers=[NS(ple=None), NS(ple=NS(table=table, ngram=NS(ids=ngram_ids)))])
++    hinted = (m._hinted(w), m._hinted(NS(x3=None, layers=[NS(ple=NS(table=NS(), ngram=None))])),
++              m._hinted(NS(x3=object(), layers=w.layers)))
++    m.mtp_stage = lambda w_, b, windows: [(st, i, i + len(keep)) for i, (st, keep, _) in enumerate(windows)]
++    d = object.__new__(m.MultiDecoder)
++    d.depth, d.confidence, d.w, d.chain_graphs = 6, 0.6, w, None
++    d.chain_rule, d.chain_t, d.tok_ms, d.verdict = "conf", 0.3, None, None
++    d.hints = NS(submit=lambda fn, *a: fn(*a))        # the hint thread, run in place
++    d.mbuf, d.buf = NS(streams=list(range(64))), NS(streams=list(range(64)))
++    d._mtp = lambda segs: Rows(sid_of[id(st)] for st, _, _ in segs)
++    probs = {1: [0.9] * 6, 2: [0.9, 0.9, 0.3, 0.9, 0.9, 0.9], 3: [0.9] * 6, 4: [0.2] * 6}
++    d._picks = lambda logits, positions, smp: [
++        (50 * sid + pos, probs[sid][pos - by[sid].st.pos - 1]) for sid, pos in zip(logits, positions)]
++    copy = {3: [7, 8, 9, 10, 11, 12, 13, 14, 15]}
++    streams = [NS(sid=i, st=State(20 + i, np.array([i * 17])), out=[100 + i], count=60, sampling=None, draft=True,
++                  context=[], copies=NS(propose=lambda c, n, i=i: list(copy.get(i, [])))) for i in (1, 2, 3, 4)]
++    by = {s.sid: s for s in streams}
++    d.streams = dict(by)
++    sid_of = {id(s.st): s.sid for s in streams}
++    m.MultiDecoder._draft_all(d, [(s, 0, [s.out[-1]]) for s in streams])
++    got = {tuple(r) for a in seen for r in a}
++    want = {tuple(r) for s in streams for r in ngram_ids(s.st.ple_history, [s.out[-1], *s.drafts])}
++    counts = [len(s.drafts) for s in streams]
++    ok = hinted == (True, False, False) and got == want and counts == [6, 2, 9, 1]
++    return ok, f"_hinted (ssd, memory, EXL3) {hinted}; drafts {counts}; rows hinted {len(got)}, looked up next " \
++        f"{len(want)}, missing {len(want - got)}, extra {len(got - want)}"
++
++
++def hints_switch():
++    code = ("from types import SimpleNamespace as N; from tensorfold.families.qwen4_exp.cuda import multi as m; "
++            "print(m._hinted(N(x3=None, layers=[N(ple=N(table=N(will_need=print), ngram=None))])))")
++    env = {k: v for k, v in os.environ.items() if k != "TENSORFOLD_PLE_HINTS"}
++    on = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True).stdout.strip()
++    off = subprocess.run([sys.executable, "-c", code], env={**env, "TENSORFOLD_PLE_HINTS": "0"},
++                         capture_output=True, text=True).stdout.strip()
++    return on == "True" and off == "False", f"default {on}, TENSORFOLD_PLE_HINTS=0 {off}"
++
++
++DIR = Path(tempfile.mkdtemp(prefix="plecheck-", dir=sys.argv[1] if len(sys.argv) > 1 else None))
++COUNT = write_table(DIR)
++check("gathers return the memory-mapped table's rows, cold and warm", rows_match)
++check("a warm decode gather reads on the calling thread; cold misses and big gathers go to the threads",
++      threads_only_for_misses)
++check("a partly cached read keeps its cached bytes and hands on the rest", partial)
++check("TENSORFOLD_PLE_NOWAIT=0 sends every read to the threads", nowait_switch)
++check("will_need advises each row's three parts, nothing outside the table or once closed", will_need)
++check("_draft_all hints exactly the rows the next round's stage looks up", hints)
++check("TENSORFOLD_PLE_HINTS=0 turns the hints off", hints_switch)
++for f in DIR.iterdir():
++    f.unlink()
++DIR.rmdir()
++print("ALL PASS" if not fails else f"{fails} FAIL", flush=True)
++sys.exit(1 if fails else 0)

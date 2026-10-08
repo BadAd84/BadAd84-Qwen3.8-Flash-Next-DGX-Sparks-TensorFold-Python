@@ -1,0 +1,906 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aa748de..2d0a00b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,15 @@ release ends at is given, and the prebuilt images are
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- Copy drafts follow TensorFold #319 by [Arminova](https://github.com/Arminova), ported from 0.6.4 to v0.6.1
++  (patch `0012-flash-next-copy-first`): on one GPU a round first verifies a copy from the context, its window
++  growing from 16 to 64 rows while copies land whole. A reply that repeats its prompt word for word went from
++  153.8 to ~535 tok/s, a one-word rewrite from 141.4 to ~322 tok/s; prose, code and prefill within noise; the
++  replies are byte-identical. `TENSORFOLD_MTP_COPY` is gone: copies are on whenever MTP drafts are, on one GPU.
++  The startup estimate at the defaults goes from 85.39 to 85.81 GiB.
++
+ ## [0.6.0] - 2026-10-02
+ 
+ Commit `22a3010` (#13). Images unchanged from 0.5.0.
+diff --git a/CREDITS.md b/CREDITS.md
+index fcdda76..fb2f8d5 100644
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -44,6 +44,10 @@ This repository is a thin layer of scripts and patches. Almost everything that m
+   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
+   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
+   built from each language's Wikipedia by token frequency.
++- `0012-flash-next-copy-first`: a port of [TensorFold #319](https://github.com/ashhart/TensorFold/pull/319)
++  (copies from the context before MTP chains, windows growing to 64 rows) by
++  **[Arminova](https://github.com/Arminova)**, closed unmerged upstream, from TensorFold 0.6.4 to v0.6.1. The port
++  by [BadAd84](https://github.com/BadAd84).
+ 
+ ## Runtime stack
+ 
+diff --git a/README.md b/README.md
+index d32947c..3b6e8b7 100644
+--- a/README.md
++++ b/README.md
+@@ -286,7 +286,6 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
+ | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
+ | `VISION_MAX_IMAGES` | `50` | images a request may carry, all of a chat's turns counted (`--vision-max-images`) |
+ | `TENSORFOLD_PREFILL_ROWS` | `2048` with `PLE_ON_SSD=1` | prompt piece rows, admitted at startup (256 to 16,384). Empty lets TensorFold choose (4,096 while idle without vision), which measured 10-30% slower from 5k to 16k tokens with the n-gram tables on SSD |
+-| `TENSORFOLD_MTP_COPY` | `1` | prompt-lookup drafts for text that repeats the prompt (needs `PARALLEL` >= 2); `0` turns them off |
+ | `TENSORFOLD_IMAGE_TOKENS` | `16384` | the tokens a request's images share, each at most 4,096 |
+ | `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget |
+ | `TENSORFOLD_VISION_WORKSPACE_MIB` | `0` | what startup reserves for the vision tower's scratch |
+@@ -325,6 +324,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
+ | Patch | Change |
+ | --- | --- |
+ | `0002-flash-next-v061` | Flash Next on v0.6.1: video input and up to 50 images sharing 16,384 tokens on top of TensorFold's own Flash Next image input (which came from this recipe's v0.6.0 vision patch), copy drafts with compact MTP rows, a `TENSORFOLD_PREFILL_ROWS` override, SSD read-ahead around the n-gram table, first token before the next draft, no unused MTP logits while prompts absorb, 96 MiB request bodies. Percentage effects in older notes were measured on v0.5.0, not on this pin. |
++| `0012-flash-next-copy-first` | Copies from the context before MTP chains, on one GPU (a port of TensorFold #319 by Arminova): a round first verifies a copied continuation when the context repeats eight or more tokens, else the MTP chain. A copy's window starts at 16 rows, doubles while copies land whole (up to 64) and halves after a break; with `PARALLEL` >= 2 every stream keeps its chain's rows and copies share the rest of the round's 64 rows, oldest stream first. Replaces 0002's copy drafts and their `TENSORFOLD_MTP_COPY` switch. The startup estimate counts the 64-row window: 85.39 -> 85.81 GiB at the defaults |
+ | `languages/0010-flash-next-draft-languages` | Opt-in language image only (`DRAFT_LANGUAGE`): language draft vocabularies for the MTP head. |
+ 
+ v0.6.1 brings, upstream: shared system prompts copied into a free stream instead of filled again (measured here: a 31k-token system prompt answered a new question in 0.18 s instead of 14 s), forks that resume from the shared prefix, short prompts admitted while a long one fills, `--vision-max-images`, vLLM-named `/metrics`, and the fix for a refused request breaking the next one on its connection. Its startup reserve is `TENSORFOLD_MEMORY_RESERVE_GIB` (this recipe sets 2). Live `/health` counters, stream draft stats, and tiled QSA selection landed in v0.5.0.
+@@ -340,16 +340,16 @@ on image and video prompts, drafted replies equal the serial reference too. Any
+ 
+ The scripts in `tools/` talk to the running server (`API_URL`, default `http://127.0.0.1:8888`; or just `PORT`),
+ from this machine or another one (`API_URL=http://<spark-address>:8888 tools/bench.py`).
+-`tools/test_copy_draft_rows.py` is the exception: it exercises patched TensorFold source on the CPU.
++`tools/test_astra_patches.py` and the `tools/*_check.py` scripts are the exceptions: they exercise patched TensorFold source on the CPU.
+ 
+ | Script | What it does |
+ | --- | --- |
+ | `tools/bench.py [label]` | smoke: prefill at ~0.85k / 3.2k / 12.6k / 50k tokens (fresh random prompts) and a short decode check. `--suite --seed 1 --jsonl run.jsonl --clients 1,2,4,5` is the concurrent, fixed-seed driver |
+-| `tools/test_copy_draft_rows.py` | mixed copy/MTP proposal-row ownership (needs `TF_SRC` pointing at patched TensorFold `src`; no model) |
+ | `tools/test_astra_patches.py` | first-token-before-draft, MTP absorb-without-head, PLE concat, native worker counts (`TF_SRC`) |
+ | `tools/needle.py` | hides a passphrase in a ~195k-token prompt and checks the model returns it |
+ | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+ | `tools/visioncheck.py` | sends a drawn image (a red circle and a blue square) and checks the model names both |
++| `tools/copy_first_check.py <config.json>` | copy windows, `copies.fit`, copy and chain rows in `_draft_all`, the admission's 64-row window and the wiring for patch 0012 (CPU, no weights; `config.json` is the checkpoint's) |
+ 
+ ## Repository layout
+ 
+diff --git a/patches/0012-flash-next-copy-first.patch b/patches/0012-flash-next-copy-first.patch
+new file mode 100644
+index 0000000..507ad14
+--- /dev/null
++++ b/patches/0012-flash-next-copy-first.patch
+@@ -0,0 +1,377 @@
++Flash Next on one GPU: a copy from the context goes before the MTP chain, its window growing from 16 to 64 rows while copies land whole (TensorFold PR #319 by Arminova, ported from 0.6.4 to v0.6.1).
++--- tensorfold/cuda/geometry.py
+++++ tensorfold/cuda/geometry.py
++@@ -413,18 +413,19 @@
++ 
++ 
++ def indexed_stream_geometry(t: dict, streams: int, each: int, keep: int, *, mtp: bool, kv_bits: int = 16,
++-                            first: int = 256, prefill_rows: int = PREFILL_ROWS) -> Geometry:
++-    """Flash Next's concurrent decoder on one GPU: per-row windows and kept snapshots sized to share one GPU."""
+++                            first: int = 256, prefill_rows: int = PREFILL_ROWS,
+++                            rows: int | None = None, scratch: int | None = None) -> Geometry:
+++    """Flash Next's concurrent decoder: ``rows`` window rows in all, ``scratch`` replay rows a slot, kept snapshots."""
++ 
++     linear, attention = layer_counts(t)
++     d, h, hk, hd, nk, nv, dk, dv, width = _gdn_dims(t, 1)
++     hc = int(t.get("hc_count", 1))
++     index_dim, ratio = int(t.get("indexer_head_dim", 128)), int(t.get("indexer_compress_ratio", 4))
++-    budget, rows = int(t.get("indexer_budget", 2048)), streams * each
+++    budget, rows = int(t.get("indexer_budget", 2048)), rows or streams * each
++     rec = linear * nv * dk * dv * 4
++     conv = linear * (int(t["linear_conv_kernel_dim"]) - 1) * (2 * nk * dk + nv * dv) * 2
++     tail = (int(t.get("ple_conv_kernel_size", 4)) - 1) * int(t.get("ngram_size", 3)) * hc * d * 2
++-    fixed = streams * (2 * rec + conv + tail + linear * each * (nk * dk * 4 + nv * dv * 4 + nv * 8))
+++    fixed = streams * (2 * rec + conv + tail + linear * (scratch or each) * (nk * dk * 4 + nv * dv * 4 + nv * 8))
++     fixed += (keep + streams) * (rec + conv + tail + int(mtp) * hc * d * 2)  # retained plus this pass's cuts
++     slots = int(t.get("num_experts_per_tok", 1)) + 1
++     moe = int(t.get("moe_intermediate_size", t.get("intermediate_size", d)))
++--- tensorfold/families/qwen4_exp/cuda/__init__.py
+++++ tensorfold/families/qwen4_exp/cuda/__init__.py
++@@ -1,5 +1,6 @@
++ """CUDA Flash Next verify rows match this backend's serial bits, which can differ from the Mac backend's."""
++ 
++ DEPTH = 6            # most MTP drafts a round
+++COPY_ROWS = 64       # a copied continuation's widest verify window (one GPU)
++ CONFIDENCE = 0.7     # a chain ends before a draft the MTP head gives less than this (one stream or many)
++ CONTEXT = 8192       # prompt plus reply tokens the caches hold
++--- /dev/null
+++++ tensorfold/families/qwen4_exp/cuda/copies.py
++@@ -0,0 +1,39 @@
+++"""Flash Next's copies from the context: a window grows from 16 rows while copies land whole, halving after a break."""
+++
+++from __future__ import annotations
+++
+++from typing import Sequence
+++
+++from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
+++
+++
+++class Copies:
+++    """One reply's copies beside MTP chains of ``chain`` rows: its context's index and its window, up to ``most``."""
+++
+++    def __init__(self, chain: int, most: int) -> None:
+++        self.index, self.chain, self.most = CopyIndex(), chain, most
+++        self.rows = next_copy_rows(chain, False, chain, most)
+++        self.copied = False                          # whether this round's drafts are a copy
+++
+++    def propose(self, context: Sequence[int], left: int) -> list[int]:
+++        """A repeat of the context for the window, at most ``left`` tokens (none: an MTP chain drafts instead)."""
+++
+++        got = self.index.propose(context, min(self.rows - 1, left))
+++        self.copied = bool(got)
+++        return got
+++
+++    def landed(self, verified: int, kept: int) -> None:
+++        """After a round: a copy's window doubles when it kept every verified row, else halves."""
+++
+++        if self.copied:
+++            self.rows = next_copy_rows(self.rows, kept == verified, self.chain, self.most)
+++
+++
+++def fit(live: Sequence, rows: int, chain: int) -> None:
+++    """A round's ``rows``: ``chain`` for every stream, copies past it sharing the rest, oldest stream first."""
+++
+++    spare = rows - chain * len(live)
+++    for s in sorted(live, key=lambda x: x.sid):
+++        take = min(max(0, len(s.drafts) + 1 - chain), spare)
+++        s.drafts = s.drafts[:chain - 1 + take]
+++        spare -= take
++--- tensorfold/families/qwen4_exp/cuda/decode.py
+++++ tensorfold/families/qwen4_exp/cuda/decode.py
++@@ -14,9 +14,10 @@
++ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
++ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
++ 
++-from . import CONFIDENCE, DEPTH
+++from . import CONFIDENCE, COPY_ROWS, DEPTH
++ from .forward import Cut, commit, cut_snapshot, forward, read_ahead
++ from . import image_rows
+++from .copies import Copies
++ from .state import CAND, Buffers, State
++ from .mtp import mtp_forward
++ from .weights import Weights
++@@ -414,8 +415,10 @@
++ @torch.no_grad()
++ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, depth: int = DEPTH,
++                confidence: float = CONFIDENCE, stop_eos: bool = False, on_tokens=None, constraint=None,
++-               probabilities=None) -> DecodeResult:
++-    """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and call ``on_tokens(new)`` with kept tokens after pending, stopping on True."""
+++               probabilities=None, prompt: Sequence[int] = ()) -> DecodeResult:
+++    """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and
+++    call ``on_tokens(new)`` with kept tokens after pending, stopping on True; with ``prompt``, a copy from the context
+++    goes before an MTP chain, its window doubling while copies land whole."""
++ 
++     w, st, b = e.w, e.st, e.buf
++     out = [pending]
++@@ -424,9 +427,20 @@
++     widths: list[int] = []
++     pos0 = st.pos
++     unabsorbed = None                                  # the last round's kept rows, not yet in the MTP cache
+++    context, copies = list(prompt) + [pending], Copies(depth + 1, min(e.rows, COPY_ROWS)) if prompt else None
+++
+++    def drafting(streams: torch.Tensor, kept: list[int], n: int) -> list[int]:
+++        """An exact repeat of the context first (a long, likely window; the MTP cache absorbs the kept rows), else a chain."""
+++
+++        copied = copies.propose(context, n) if copies is not None else []
+++        if copied:
+++            absorb(e, streams, kept)
+++            return copied
+++        return draft(e, streams, kept, st.pos + 1, min(depth, n), sampling, confidence)
+++
++     torch.cuda.synchronize()
++     start = time.perf_counter()
++-    drafts = draft(e, e.last_streams, [pending], st.pos + 1, min(depth, count - len(out)), sampling, confidence)
+++    drafts = drafting(e.last_streams, [pending], count - len(out))
++     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++         tokens = [out[-1]] + drafts
++         window = constraint.window(tokens, list(range(-1, len(tokens) - 1))) if constraint is not None else None
++@@ -446,6 +460,8 @@
++             n = min(keep, count - len(out))
++             capture(logits[:n], sampled[:n], list(range(st.pos + 1, st.pos + 1 + n)), probabilities)
++         commit(w, st, b, R, keep)
+++        if copies is not None:
+++            copies.landed(R, keep)
++         unabsorbed = (keep, sampled[:keep])
++         rounds += 1
++         drafted += len(drafts)
++@@ -456,15 +472,13 @@
++         if constraint is not None:
++             constraint.advance(sampled[:keep])
++         out.extend(sampled[:keep])
+++        context.extend(sampled[:keep])
++         if on_tokens is not None and new and on_tokens(new):
++             break
++         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
++             break
++-        n = min(depth, count - len(out))
++-        drafts = []
++-        if n > 0:
++-            drafts = draft(e, b.streams[:keep], sampled[:keep], st.pos + 1, n, sampling, confidence)
++-            unabsorbed = None
+++        drafts = drafting(b.streams[:keep], sampled[:keep], count - len(out))
+++        unabsorbed = None
++     torch.cuda.synchronize()
++     seconds = time.perf_counter() - start
++     if unabsorbed is not None:              # the MTP cache takes the last kept rows: it then covers the sequence
++--- tensorfold/families/qwen4_exp/cuda/engine.py
+++++ tensorfold/families/qwen4_exp/cuda/engine.py
++@@ -9,7 +9,7 @@
++ from typing import Any, Callable
++ 
++ from tensorfold.cuda import prompt_precision
++-from . import CONFIDENCE, DEPTH
+++from . import CONFIDENCE, COPY_ROWS, DEPTH
++ 
++ MAX_DEPTH = 15           # a verify window of at most 16 rows
++ KEEP_SERIAL = 4          # prompt states the serial engine keeps (they share its attention rows)
++@@ -87,10 +87,13 @@
++             self.comm.barrier()
++         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
++         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
+++        copies = mtp and tp == 1                         # copies from the context: one GPU (two ranks: MTP chains)
+++        rows = max(each, COPY_ROWS) if copies else each  # a window's most rows a slot can replay
++         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
++         rows0 = chunk or PREFILL_ROWS
++         geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits,
++-                                                          prefill_rows=rows0))
+++                                                          prefill_rows=rows0, scratch=rows,
+++                                                          rows=max(streams * each, rows)))
++                     if streams > 1 else
++                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
++                                                kept=KEEP_SERIAL + 1, prefill_rows=rows0)))
++@@ -161,10 +164,11 @@
++             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
++                                       confidence=self.confidence, keep=KEEP, points=self.points,
++                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
++-                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace)
+++                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace,
+++                                      copy_rows=COPY_ROWS if copies else 0)
++             self.scheduler = Scheduler(self.multi, max_streams=streams)
++         else:
++-            self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
+++            self.e = Engine(w, capacity=self.max_len, max_rows=max(8, rows), graphs=graphs,
++                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
++         started = time.perf_counter()
++         locked = False
++@@ -178,7 +182,7 @@
++                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
++                 locked = room >= size and table.lock()
++         read_s = time.perf_counter() - started
++-        captured = self.e.graphs.warm(self.depth + 1) if self.e is not None and self.e.graphs is not None else 0
+++        captured = self.e.graphs.warm(rows) if self.e is not None and self.e.graphs is not None else 0
++         started = time.perf_counter()
++         if self.concurrent:
++             self.multi.warm()
++@@ -197,6 +201,8 @@
++         self.serial = None                                # the serial requests' engine, made on first use
++         rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
++                 f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
+++        if copies:
+++            rule = f"a copy from the context first (up to {COPY_ROWS - 1} tokens, while copies land whole), else {rule}"
++         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
++                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
++                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
++@@ -370,7 +376,8 @@
++             return stats
++         if self.depth > 0:
++             res = mtp_decode(self.e, first, max_tokens, sampling, depth=self.depth, confidence=self.confidence,
++-                             stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities)
+++                             stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint, probabilities=probabilities,
+++                             prompt=prompt if self.tp == 1 else ())
++             stats.update(drafted=res.drafted, accepted=res.accepted, min_rows=min(res.widths, default=0))
++         else:
++             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
++--- tensorfold/families/qwen4_exp/cuda/multi.py
+++++ tensorfold/families/qwen4_exp/cuda/multi.py
++@@ -18,13 +18,14 @@
++ from tensorfold.engine.exact_sampling import MARGIN, choose_rows
++ from tensorfold.engine.grammar import GrammarError
++ 
++-from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_begin
+++from .decode import PREFILL_ROWS, WARM_TAIL, Engine, absorb, draft, entry_end, prefill_begin
++ from . import attn_multi, gdn_multi, image_rows, prefixes
+++from .copies import Copies, fit
++ from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, read_ahead, stage
++ from .mtp import mtp_compute, mtp_stage
++ from .prompt_plan import pass_limit
++ from .state import ENDS, Buffers, State
++-from ..cuda import CONFIDENCE, DEPTH
+++from ..cuda import CONFIDENCE, COPY_ROWS, DEPTH
++ 
++ FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's caches grow by at a time
++ GIB = 1024**3
++@@ -49,15 +50,16 @@
++ 
++     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
++                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
++-                 share: float = SHARE, points=None, vision=None, workspace_bytes: int = 0) -> None:
+++                 share: float = SHARE, points=None, vision=None, workspace_bytes: int = 0,
+++                 copy_rows: int = COPY_ROWS) -> None:
++         if w.comm is not None:
++             raise ValueError("concurrent Flash Next runs on one GPU for now")
++         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
++         self.points = points                         # a prompt's message starts to keep states at, or None
++         self.vision = vision
++-        self.copy = os.environ.get("TENSORFOLD_MTP_COPY", "0") == "1"
+++        self.copy_rows = copy_rows if depth > 0 and w.comm is None else 0   # a copy's widest window (0: none)
++         self.eos = tuple(w.cfg.eos) if stop_eos else ()
++-        rows = slots * (depth + 1)
+++        rows = max(slots * (depth + 1), self.copy_rows)  # a chain's rows a stream; copies share what chains leave
++         # a round's window and a prompt pass share each layer's expert launch: the pass's buffers hold both
++         self.converged, self.prefill_rows = converges(w), prefill_rows
++         # rounds beside a filling prompt size its pass so decoding keeps ``share`` of the pass's time (0: whole passes)
++@@ -68,7 +70,9 @@
++         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
++         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
++         # slots start small and grow with their stream's context, up to the window, while the gate has room
++-        self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
+++        # every slot's replay rows hold a copy: any slot may host one stream's wide window
+++        self.free = [State(w, min(capacity, FIRST), max(depth + 1, self.copy_rows), kv_dtype, limit=capacity)
+++                     for _ in range(slots)]
++         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
++         self.window_bytes = self.free[0].cache_bytes(capacity)          # one stream's caches at the full window
++         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
++@@ -220,10 +224,6 @@
++             if s.draft and st.image_positions is None and self.points is not None else []
++         s.sid, s.st = self.next_id, st
++         self.next_id += 1
++-        if self.copy and s.draft:
++-            from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
++-
++-            s.copies = CopyIndex(COPY_MATCH)
++         s.prefill_s = time.perf_counter() - t0
++         same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
++         self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
++@@ -405,12 +405,17 @@
++             image_rows.finish(st)
++             s.context = list(s.prompt)
++             s.drafts = []
+++            s.copies = Copies(self.depth + 1, self.copy_rows) if mtp and self.copy_rows else None
++             s.started = time.perf_counter()
++             self.streams[s.sid] = s
++             s.take([first], self._ends(s))               # the first token goes out before the next draft
++-            if mtp and not s.done and s.count > 1:
++-                s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
++-                                 self.confidence)
+++            if mtp and not s.done and s.count > 1:       # the first token in the context: a copy may follow it
+++                s.drafts = s.copies.propose(s.context, s.count - len(s.out)) if s.copies is not None else []
+++                if s.drafts:
+++                    absorb(e, last, [first])
+++                else:
+++                    s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
+++                                     self.confidence)
++             if s.done:
++                 joined.append(s)
++         return joined
++@@ -431,6 +436,7 @@
++             live = [s for s in self.streams.values() if not s.done and not s.waiting]
++         if not live:
++             return ended
+++        fit(live, self.buf.rows, self.depth + 1)         # before a grammar's window: it masks the rows it keeps
++         grammars, failed = {}, []
++         for s in live:                                   # a grammar cuts the drafts no accepted path can hold
++             if s.constraint is not None:
++@@ -501,13 +507,16 @@
++                     s.error = exc
++             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
++             kept.append((s, a0, rows[:len(path)], new, last))
++-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last],
++-                        {s.sid: fresh for s, _, _, fresh, last in kept if getattr(s, "copies", None) is not None and not last})
+++        for s, (_, tokens), (path, _) in zip(live, windows, paths):
+++            if s.copies is not None:                     # the rows verified: a grammar may have cut some
+++                s.copies.landed(len(tokens), len(path))
++         for s, _, _, new, _ in kept:
++             if s.error is not None:
++                 s.done = True
++                 continue
++             s.take(new, self._ends(s))
+++        # after the take: a copy reads this round's tokens
+++        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++         spent = time.perf_counter() - t0
++         self._timed(spent, sum(n for _, _, n in pieces))
++         if pieces:                                     # prompts that ended in this round's pass join the next
++@@ -517,13 +526,13 @@
++             self.held.pop(s.sid, None)
++         return failed + done + ended
++ 
++-    def _draft_all(self, streams: list, new: dict | None = None) -> None:
++-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth.
++-        A stream whose context repeats earlier text drafts that continuation instead of an MTP row."""
+++    def _draft_all(self, streams: list) -> None:
+++        """Every drafting stream absorbs its kept rows, then copies from its context or chains MTP drafts,
+++        the chains in one step a depth."""
++ 
++         for s, _, _ in streams:
++             s.drafts = []
++-        room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
+++        room = {s.sid: min(self.depth, s.count - len(s.out)) for s, _, _ in streams}
++         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
++         if not todo:
++             return
++@@ -537,19 +546,13 @@
++         logits = self._mtp(segs)
++         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
++             st.set_mtp_len(st.mtp_len + len(keep))
++-        active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
++-        if new:
++-            for s, _ in active:
++-                if s.sid in new and getattr(s, "copies", None) is not None:
++-                    s.context.extend(new[s.sid])
++-                    s.drafts = s.copies.propose(s.context, max(room[s.sid], COPY_MATCH))[:room[s.sid]]
++-                    del s.context[len(s.context) - len(new[s.sid]):]
++-            keep_rows = [i for i, (s, _) in enumerate(active) if not s.drafts]
++-            if len(keep_rows) != len(active):
++-                logits = logits[keep_rows]
++-            active = [active[i] for i in keep_rows]
++-            if not active:
++-                return
+++            s.drafts = s.copies.propose(s.context, s.count - len(s.out)) if s.copies is not None else []
+++        chains = [i for i, (s, _, _) in enumerate(todo) if not s.drafts]
+++        if not chains:
+++            return
+++        if len(chains) < len(todo):                      # the logits of the streams that chain
+++            logits = logits[chains]
+++        active = [(todo[i][0], segs[i][2] - 1) for i in chains]
++         for j in range(self.depth):
++             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
++             nxt = []
+diff --git a/scripts/config.sh b/scripts/config.sh
+index 7a02229..34b1e37 100644
+--- a/scripts/config.sh
++++ b/scripts/config.sh
+@@ -83,9 +83,6 @@ export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
+ # Startup reserve (since v0.6.0): GiB left out of MemAvailable. Unset, TensorFold takes max(4 GiB, a tenth of RAM)
+ # and refuses 5 x 262,144. The knob's floor is 2 GiB; that still fits the measured ~102.5 GiB admission.
+ export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-2}"
+-# Prompt-lookup drafts ahead of MTP (patch 0007; with PARALLEL >= 2): +6% on replies that repeat the prompt, prose and
+-# code unchanged. 0: off.
+-export TENSORFOLD_MTP_COPY="${TENSORFOLD_MTP_COPY:-1}"
+ # The draft list the language image serves (DRAFT_LANGUAGE above).
+ [[ -z "$DRAFT_LANGUAGE" ]] || export TENSORFOLD_DRAFT_VOCAB="$DRAFT_LANGUAGE"
+ # No "is there a newer TensorFold" call to GitHub at each start: the patches are for v0.6.1 anyway. 0: check.
+diff --git a/start.sh b/start.sh
+index b27491e..0ae0a6b 100755
+--- a/start.sh
++++ b/start.sh
+@@ -131,7 +131,7 @@ else
+   warn "only ${avail_gb} GiB memory available (the default needs ~103): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
+ fi
+ 
+-# TensorFold's own switches from the environment (TENSORFOLD_*, e.g. TENSORFOLD_MTP_COPY) reach the server too.
++# TensorFold's own switches from the environment (TENSORFOLD_*, e.g. TENSORFOLD_PREFILL_ROWS) reach the server too.
+ ENV_ARGS=()
+ while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name"); done < <(env | grep -E '^TENSORFOLD_[A-Z0-9_]+=' || true)
+ 
+diff --git a/tools/copy_first_check.py b/tools/copy_first_check.py
+new file mode 100644
+index 0000000..8c47e06
+--- /dev/null
++++ b/tools/copy_first_check.py
+@@ -0,0 +1,239 @@
++#!/usr/bin/env python3
++"""tools/copy_first_check.py <config.json>: patch 0012 (copies from the context before MTP chains), CPU only, no
++weights, in the image. <config.json> is the checkpoint's (only its text config's sizes are read):
++
++    docker run --rm --entrypoint python3 -v "$PWD/tools:/t:ro" -v "$HOME/.cache/huggingface:/hf:ro" \
++      tensorfold-qwen38:v0.6.1 /t/copy_first_check.py \
++      /hf/hub/models--Vontra--Qwen3.8-Flash-Next-MLX-4bit-MTP/snapshots/<rev>/config.json
++
++Checks, against reference rules written here: a stream's copy window (`copies.Copies`: 16 rows first, doubling while
++copies land whole up to the most, halving after a break, a proposal at most the window less one row and the reply's
++room); `copies.fit` (every stream keeps its chain's rows, copies share the rest, oldest stream first);
++`MultiDecoder._draft_all` driven with fake MTP steps (a stream with a copy drafts it, the others chain from their own
++logits rows; the copy is asked for after the absorb, with the reply's room); the admission's window and scratch rows
++(`indexed_stream_geometry(rows=, scratch=)`); and the wiring, read from the code: copies on one GPU only, the decoder's
++rows, every slot's replay rows, a round's tokens taken before its drafts, the first token taken before a copy.
++The drafts change speed only; replies equal serial decoding (`"draft": false`), which this check does not run.
++Prints PASS / FAIL lines and ALL PASS; exit 1 on any FAIL.
++"""
++from __future__ import annotations
++
++import ast
++import inspect
++import json
++import sys
++import textwrap
++from types import SimpleNamespace as NS
++
++fails = 0
++
++
++def check(name, fn):
++    global fails
++    try:
++        ok, detail = fn()
++    except Exception as exc:                          # noqa: BLE001  (a missing or broken piece is a FAIL)
++        ok, detail = False, f"{type(exc).__name__}: {exc}"
++    print(("PASS " if ok else "FAIL ") + name + (f" ({detail})" if detail else ""), flush=True)
++    fails += not ok
++
++
++from tensorfold.families.qwen4_exp import cuda as pkg  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda import multi as m  # noqa: E402
++from tensorfold.families.qwen4_exp.cuda import decode as dec, engine as eng  # noqa: E402
++from tensorfold.cuda import geometry as geo  # noqa: E402
++
++
++def window_rules():
++    from tensorfold.families.qwen4_exp.cuda.copies import Copies
++
++    text = list(range(100, 140))                      # 40 tokens, then other text, then its first 8 again
++    context = text + list(range(500, 520)) + text[:8]
++    c = Copies(7, 64)
++    first = c.rows
++    got = c.propose(context, 1000)
++    sizes = [len(got)]
++    trail = [c.rows]
++    for verified, kept in ((16, 16), (32, 32), (64, 64), (64, 10), (32, 3), (16, 2), (16, 16)):
++        c.copied = True
++        c.landed(verified, kept)
++        trail.append(c.rows)
++    c.rows = 64
++    sizes.append(len(c.propose(context, 1000)))       # 63 at most: the context holds 60 tokens after the match
++    sizes.append(len(c.propose(context, 10)))
++    sizes.append(len(c.propose(context, 7)))          # shorter than the 8 matched tokens: no copy
++    none = c.propose(list(range(60)), 1000)
++    copied_after_none = c.copied
++    c.rows = 32
++    c.landed(32, 32)                                  # not a copy this round: the window stays
++    want = [16, 32, 64, 64, 32, 16, 16, 32]
++    ok = (first == 16 and got == text[8:23] and trail == want and sizes == [15, 60, 10, 0] and none == []
++          and not copied_after_none and c.rows == 32)
++    return ok, f"first {first}, windows {trail}, proposals {sizes}"
++
++
++def fit_ref(live, rows, chain):
++    spare = rows - chain * len(live)
++    out = {}
++    for s in sorted(live, key=lambda x: x.sid):
++        take = min(max(0, len(s.drafts) + 1 - chain), spare)
++        out[s.sid] = chain - 1 + take
++        spare -= take
++    return out
++
++
++def fit_rule():
++    from tensorfold.families.qwen4_exp.cuda.copies import fit
++
++    import random
++    rnd = random.Random(12)
++    bad = 0
++    for _ in range(500):
++        n, chain = rnd.randint(1, 5), 7
++        rows = max(64, n * chain)
++        live = [NS(sid=sid, drafts=list(range(rnd.choice([0, 3, 6, 15, 40, 63])))) for sid in rnd.sample(range(50), n)]
++        want = {s.sid: min(len(s.drafts), k) for s, k in zip(live, [fit_ref(live, rows, chain)[s.sid] for s in live])}
++        before = {s.sid: list(s.drafts) for s in live}
++        fit(live, rows, chain)
++        used = sum(len(s.drafts) + 1 for s in live)
++        if any(len(s.drafts) != want[s.sid] or s.drafts != before[s.sid][:len(s.drafts)] for s in live) or used > rows:
++            bad += 1
++    old = [NS(sid=1, drafts=list(range(40))), NS(sid=2, drafts=list(range(40)))]
++    fit(old, 64, 7)
++    return not bad and [len(s.drafts) for s in old] == [40, 22], f"500 rounds, {bad} wrong; two copies of 40: " \
++        f"{[len(s.drafts) for s in old]} (the older stream first)"
++
++
++class Rows(list):
++    """The MTP step's logits rows (a tensor in the engine): ``logits[keep]`` keeps those rows."""
++
++    def __getitem__(self, i):
++        return Rows(list.__getitem__(self, k) for k in i) if isinstance(i, list) else list.__getitem__(self, i)
++
++
++class State:
++    def __init__(self, pos):
++        self.pos, self.mtp_len, self.mtp_drafted = pos, pos, 0
++
++    def set_mtp_len(self, n):
++        self.mtp_len = n
++
++
++def draft_all():
++    """Five streams, copies offered to streams 1, 3 and 4: those draft their copies, 2 and 5 chain from their own
++    logits rows; every copy is asked for after the absorb set its stream's MTP length, with the reply's room."""
++    calls = []
++    m.mtp_stage = lambda w, b, windows: [(st, i, i + len(keep)) for i, (st, keep, _) in enumerate(windows)]
++
++    def copies(sid, offer):
++        def propose(context, left):
++            s = by_sid[sid]
++            calls.append((sid, list(context), left, s.st.mtp_len))
++            return list(range(1000 * sid, 1000 * sid + min(offer, left))) if offer else []
++        return NS(propose=propose)
++
++    d = object.__new__(m.MultiDecoder)
++    d.depth, d.confidence, d.w, d.hints, d.chain_graphs = 6, 0.6, None, None, None
++    d.chain_rule, d.chain_t, d.tok_ms, d.verdict = "conf", 0.3, None, None
++    d.mbuf, d.buf = NS(streams=list(range(64))), NS(streams=list(range(64)))
++    d._mtp = lambda segs: Rows(sid_of[id(st)] for st, _, _ in segs)
++    d._picks = lambda logits, positions, smp: [(10 * sid + 1, 0.99) for sid in logits]
++    offers = {1: 20, 2: 0, 3: 40, 4: 3, 5: 0}
++    streams = [NS(sid=i, st=State(30), out=[9] * i, count=40, context=[i, 9], sampling=None, draft=True,
++                  copies=copies(i, offers[i])) for i in offers]
++    by_sid = {s.sid: s for s in streams}
++    d.streams = dict(by_sid)
++    sid_of = {id(s.st): s.sid for s in streams}
++    keeps = {1: [9], 2: [9, 9], 3: [9], 4: [9, 9, 9], 5: [9]}
++    m.MultiDecoder._draft_all(d, [(s, 0, keeps[s.sid]) for s in streams])
++    ok = True
++    for s in streams:
++        room = s.count - len(s.out)
++        want = list(range(1000 * s.sid, 1000 * s.sid + min(offers[s.sid], room))) if offers[s.sid] else \
++            [10 * s.sid + 1] * 6
++        ok &= s.drafts == want
++    asked = [(sid, left, mtp) for sid, _, left, mtp in calls]
++    ok &= asked == [(s.sid, s.count - len(s.out), 30 + len(keeps[s.sid])) for s in streams]
++    every = []
++    for offer_all in (True, False):
++        for s in streams:
++            s.copies = copies(s.sid, 5 if offer_all else 0)
++            s.st = State(30)
++        sid_of = {id(s.st): s.sid for s in streams}
++        m.MultiDecoder._draft_all(d, [(s, 0, [9]) for s in streams])
++        every.append([len(s.drafts) for s in streams])
++    ok &= every == [[5] * 5, [6] * 5]
++    return ok, f"drafts {[s.drafts[:2] for s in streams]}, copies asked (stream, room, MTP length) {asked}, " \
++        f"all / none copying {every}"
++
++
++def geometry(config):
++    t = json.load(open(config))
++    t = t.get("text_config", t)
++    streams, each, keep = 5, 7, 8
++    base = geo.indexed_stream_geometry(t, streams, each, keep, mtp=True, kv_bits=8)
++    same = geo.indexed_stream_geometry(t, streams, each, keep, mtp=True, kv_bits=8, rows=streams * each, scratch=each)
++    wide = geo.indexed_stream_geometry(t, streams, each, keep, mtp=True, kv_bits=8, rows=64, scratch=64)
++    linear, _ = geo.layer_counts(t)
++    _, _, _, _, nk, nv, dk, dv, _ = geo._gdn_dims(t, 1)
++    per_row = streams * linear * (nk * dk * 4 + nv * dv * 4 + nv * 8)
++    scr = geo.indexed_stream_geometry(t, streams, each, keep, mtp=True, kv_bits=8, scratch=64)
++    caps = (4096, 65536, 262144)
++    ok = all(same.bytes_at(c) == base.bytes_at(c) for c in caps) and \
++        all(scr.bytes_at(c) - base.bytes_at(c) == (64 - each) * per_row for c in caps) and \
++        all(wide.bytes_at(c) > scr.bytes_at(c) for c in caps)
++    return ok, f"at 262,144: {base.bytes_at(262144) / 2**30:.3f} GiB -> {wide.bytes_at(262144) / 2**30:.3f} GiB " \
++        f"(64 replay rows a slot, 64 window rows)"
++
++
++def _assign(fn, target):
++    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
++    for n in ast.walk(tree):
++        if isinstance(n, ast.Assign) and any(ast.unparse(t) == target for t in n.targets):
++            return compile(ast.Expression(n.value), target, "eval")
++    raise LookupError(f"no assignment to {target} in {fn.__qualname__}")
++
++
++def _lines(fn, text):
++    src = textwrap.dedent(inspect.getsource(fn)).splitlines()
++    return [i for i, line in enumerate(src) if text in line]
++
++
++def wiring():
++    init = m.MultiDecoder.__init__
++    cr = _assign(init, "self.copy_rows")
++    copy_rows = [eval(cr, {"copy_rows": 64, "depth": dp, "w": NS(comm=c)}) for dp, c in ((6, None), (0, None), (6, 1))]
++    rows = eval(_assign(init, "rows"), {"max": max, "slots": 10, "depth": 6, "self": NS(copy_rows=64)})
++    rows1 = eval(_assign(init, "rows"), {"max": max, "slots": 1, "depth": 6, "self": NS(copy_rows=64)})
++    slot = "max(depth + 1, self.copy_rows)" in inspect.getsource(init)
++    load = None
++    for _, cls in inspect.getmembers(eng, inspect.isclass):
++        for _, f in inspect.getmembers(cls, inspect.isfunction) if cls.__module__ == eng.__name__ else ():
++            try:
++                _assign(f, "copies")
++                load = f
++            except (LookupError, OSError, TypeError):
++                pass
++    on = [eval(_assign(load, "copies"), {"mtp": mtp, "tp": tp}) for mtp, tp in ((True, 1), (True, 2), (False, 1))]
++    serial = "prompt" in inspect.signature(dec.mtp_decode).parameters and \
++        "prompt=prompt if self.tp == 1 else ()" in inspect.getsource(eng)
++    rnd = m.MultiDecoder.round
++    take, draft, landed = _lines(rnd, "s.take(new"), _lines(rnd, "self._draft_all("), \
++        _lines(rnd, "s.copies.landed(len(tokens), len(path))")
++    join = m.MultiDecoder._joined
++    first, copy = _lines(join, "s.take([first]"), _lines(join, "s.copies.propose(s.context")
++    ok = (copy_rows == [64, 0, 0] and rows == 70 and rows1 == 64 and slot and on == [True, False, False] and serial
++          and pkg.COPY_ROWS == 64 and take and draft and take[-1] < draft[0] and len(landed) == 1
++          and first and copy and first[0] < copy[0])
++    return ok, f"copy rows (one GPU / no MTP / two ranks) {copy_rows}, decoder rows at 10 / 1 streams {rows} / {rows1}, " \
++        f"copies on (one GPU, two ranks, no MTP) {on}, serial decode copies {serial}, take before drafts " \
++        f"{take[-1:]} < {draft[:1]}, first token before a copy {first[:1]} < {copy[:1]}"
++
++
++check("a copy's window: 16 rows, doubling while copies land whole (to 64), halving after a break", window_rules)
++check("copies.fit: chains keep their rows, copies share the rest, oldest stream first", fit_rule)
++check("_draft_all: copies drafted, the other streams chain from their own logits rows", draft_all)
++check("admission counts the 64-row window and every slot's 64 replay rows", lambda: geometry(sys.argv[1]))
++check("wiring: one GPU only, the decoder's rows, slots' replay rows, take before drafts, first token first", wiring)
++print("ALL PASS" if not fails else f"{fails} FAIL", flush=True)
++sys.exit(1 if fails else 0)
+diff --git a/tools/test_copy_draft_rows.py b/tools/test_copy_draft_rows.py
+deleted file mode 100644
+index 924dc2c..0000000
+--- a/tools/test_copy_draft_rows.py
++++ /dev/null
+@@ -1,171 +0,0 @@
+-#!/usr/bin/env python3
+-"""Copy/MTP proposal-row ownership in MultiDecoder._draft_all, without loading the model.
+-
+-Patch 0007 drops copy-covered streams from `active` but left their compact MTP rows in `logits`.
+-`_picks` reads those rows sequentially, so a remaining stream can sample another stream's proposal.
+-Patch 0010 compacts logits to the surviving todo ordinals. Residual `row` stays a buffer offset.
+-
+-Usage:
+-  TF_SRC=/path/to/patched/src python3 tools/test_copy_draft_rows.py
+-
+-TF_SRC is TensorFold's `src` directory with this recipe's patches already applied (0002-0013 on v0.5.0).
+-Exit code 1 if any case misaligns. This checks control-flow row ownership, not model accuracy.
+-"""
+-from __future__ import annotations
+-
+-import ast
+-import os
+-import sys
+-from itertools import product
+-from pathlib import Path
+-from types import SimpleNamespace as NS
+-
+-COPY_TOKEN = 99
+-
+-
+-class Rows:
+-    """Minimal compact-row container: production uses a torch tensor; `logits[keep]` must work."""
+-
+-    def __init__(self, xs):
+-        self.xs = [int(x) for x in xs]
+-
+-    def __getitem__(self, idx):
+-        if isinstance(idx, list):
+-            return Rows(self.xs[i] for i in idx)
+-        if isinstance(idx, slice):
+-            return Rows(self.xs[idx])
+-        return self.xs[idx]
+-
+-    def __len__(self):
+-        return len(self.xs)
+-
+-    def __iter__(self):
+-        return iter(self.xs)
+-
+-
+-class State:
+-    def __init__(self, logit_id: int):
+-        self.mtp_drafted = 0
+-        self.mtp_len = 0
+-        self.pos = 10
+-        self.logit_id = logit_id
+-
+-    def set_mtp_len(self, n):
+-        self.mtp_len = n
+-
+-
+-def extract_draft_all(src: Path):
+-    path = src / "tensorfold/families/qwen4_exp/cuda/multi.py"
+-    tree = ast.parse(path.read_text())
+-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MultiDecoder")
+-    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_draft_all")
+-    staged = []
+-
+-    def stage(w, b, windows):
+-        segs, at = [], 0
+-        for st, keep, _ in windows:
+-            segs.append((st, at, at + len(keep)))
+-            at += len(keep)
+-        staged.append([(st.logit_id, len(keep), at0, at1) for st, at0, at1 in segs])
+-        return segs
+-
+-    def compute(w, segs, b):
+-        return Rows(st.logit_id for st, _, _ in segs)
+-
+-    scope = dict(COPY_MATCH=8, mtp_stage=stage, mtp_compute=compute)
+-    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), scope)
+-    return scope["_draft_all"], staged
+-
+-
+-def stream(sid: int, copied: bool, logit_id: int, keep: list[int], sampling=None):
+-    s = NS(sid=sid, st=State(logit_id), out=[1], count=100, sampling=sampling,
+-           context=[1], copies=NS(propose=lambda context, n: [COPY_TOKEN] * n if copied else []),
+-           drafts=None)
+-    return s, sid - 1, keep   # a0 is unused by the fake stage; keep length sets residual a1-1
+-
+-
+-def run_case(draft_all, copies, keeps, depth=1, samplings=None):
+-    n = len(copies)
+-    ids = [10 * (i + 1) + 1 for i in range(n)]          # 11, 21, 31, ...
+-    samplings = samplings or [NS(name=f"s{i}") for i in range(n)]
+-    todo = [stream(i + 1, copies[i], ids[i], keeps[i], samplings[i]) for i in range(n)]
+-    streams = [t[0] for t in todo]
+-    decoder = NS(depth=depth, confidence=0.6, w=None,
+-                 mbuf=NS(streams=list(range(64))), buf=NS(streams=list(range(64))),
+-                 _picks=lambda logits, positions, smp: [(int(logits[i]), 1.0) for i in range(len(positions))])
+-    new = {s.sid: [2] for s in streams}
+-    draft_all(decoder, todo, new)
+-    want, got = [], []
+-    for s, copied, logit_id in zip(streams, copies, ids):
+-        expected = [COPY_TOKEN] * min(depth, 99) if copied else [logit_id] * min(depth, 99)
+-        # room = min(depth, count - len(out) - len(keep)); depth=1 and room>=1 → one draft
+-        room = min(depth, s.count - len(s.out) - len(next(k for t, a0, k in todo if t is s)))
+-        expected = expected[:room]
+-        want.append(expected)
+-        got.append(list(s.drafts))
+-    return want, got, streams
+-
+-
+-def main() -> int:
+-    src = Path(os.environ.get("TF_SRC", "") or "")
+-    if not src.is_dir():
+-        sys.exit("set TF_SRC to TensorFold's patched src directory (this recipe's patches 0001-0010 applied)")
+-    draft_all, _staged = extract_draft_all(src)
+-    failed = 0
+-
+-    # Two-stream matrix from docs/astra.md, plus both-copy / neither-copy.
+-    print("two streams, keep length 1:")
+-    for copy_a, copy_b in product((False, True), repeat=2):
+-        want, got, _ = run_case(draft_all, [copy_a, copy_b], [[1], [1]])
+-        ok = got == want
+-        failed += not ok
+-        print(f"  copy={copy_a, copy_b} expected {want} actual {got} aligned {ok}")
+-
+-    # Middle, first, last, and two-of-three removals; residual rows diverge from logit rows.
+-    print("three streams, mixed keep lengths 2/1/3 (residual a1-1 is not the compact logit index):")
+-    keeps = [[1, 1], [1], [1, 1, 1]]
+-    for copies in product((False, True), repeat=3):
+-        want, got, streams = run_case(draft_all, list(copies), keeps)
+-        ok = got == want
+-        failed += not ok
+-        if not ok or (any(copies) and not all(copies)):
+-            print(f"  copy={copies} expected {want} actual {got} aligned {ok}")
+-
+-    print("three streams, identical keep lengths, every removed position:")
+-    for copies in (
+-        (True, False, False),
+-        (False, True, False),
+-        (False, False, True),
+-        (True, True, False),
+-        (True, False, True),
+-        (False, True, True),
+-    ):
+-        want, got, _ = run_case(draft_all, list(copies), [[1], [1], [1]])
+-        ok = got == want
+-        failed += not ok
+-        print(f"  copy={copies} expected {want} actual {got} aligned {ok}")
+-
+-    print("mixed sampling objects stay paired with surviving streams:")
+-    want, got, streams = run_case(
+-        draft_all, [True, False, True], [[2], [1], [3]],
+-        samplings=[NS(name="A"), NS(name="B"), NS(name="C")])
+-    ok = got == want and streams[1].sampling.name == "B"
+-    failed += not ok
+-    print(f"  expected {want} actual {got} sampling {streams[1].sampling.name} aligned {ok}")
+-
+-    print("all-copy returns without MTP picks; no-copy keeps source rows:")
+-    want, got, _ = run_case(draft_all, [True, True], [[1], [1]])
+-    ok = got == want
+-    failed += not ok
+-    print(f"  all-copy expected {want} actual {got} aligned {ok}")
+-    want, got, _ = run_case(draft_all, [False, False, False], [[2], [1], [1]])
+-    ok = got == want
+-    failed += not ok
+-    print(f"  no-copy expected {want} actual {got} aligned {ok}")
+-
+-    print("FAIL" if failed else "OK", f"{failed} misaligned" if failed else "all cases aligned")
+-    return 1 if failed else 0
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(main())

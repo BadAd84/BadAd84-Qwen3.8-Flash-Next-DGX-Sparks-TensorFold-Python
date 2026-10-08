@@ -1,0 +1,474 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aa748de..8c83ba3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,14 @@ release ends at is given, and the prebuilt images are
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- `TENSORFOLD_CHAIN_RULE` (patch `0015-flash-next-chain-stop`): where an MTP chain stops. The default, `conf`,
++  is v0.6.1's rule. `cum` stops a chain once the calibrated chance that all its drafts land falls under
++  `TENSORFOLD_CHAIN_T` (0.30). With `TENSORFOLD_CHAIN_RULE=cum MTP_DRAFTS=8`, per request: code 85.3 / 64.4 /
++  41.1 -> 90.0 / 63.3 / 42.1 tok/s at 1 / 2 / 4 streams, prose 74.2 / 50.5 / 32.1 -> 74.4 / 51.1 / 32.4; replies
++  byte-identical. Needs 0012 and 0013.
++
+ ## [0.6.0] - 2026-10-02
+ 
+ Commit `22a3010` (#13). Images unchanged from 0.5.0.
+diff --git a/CREDITS.md b/CREDITS.md
+index fcdda76..f17a7c5 100644
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -44,6 +44,7 @@ This repository is a thin layer of scripts and patches. Almost everything that m
+   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
+   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
+   built from each language's Wikipedia by token frequency.
++- `0015-flash-next-chain-stop` (MTP chain stop rules and the draft head's landing curve): by [BadAd84](https://github.com/BadAd84).
+ 
+ ## Runtime stack
+ 
+diff --git a/README.md b/README.md
+index d32947c..d84399a 100644
+--- a/README.md
++++ b/README.md
+@@ -279,6 +279,7 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
+ | `VISION_URLS` | `0` | `1` also accepts public `https://` image and video URLs (default: data URLs only) |
+ | `DRAFT_LANGUAGE` | empty | `zh` or `ja`: serve the language image, for replies mostly in that language ([Other languages](#other-languages)) |
+ | `MTP_DRAFTS` / `MTP_CONFIDENCE` | `6` / `0.60` | at most 6 MTP drafts a round; a chain stops before a draft under 60% |
++| `TENSORFOLD_CHAIN_RULE` / `TENSORFOLD_CHAIN_T` | `conf` / `0.30` | where an MTP chain stops (patch 0015): `conf` is the `MTP_CONFIDENCE` rule above; `cum` stops once the calibrated chance that every draft lands falls under `TENSORFOLD_CHAIN_T`. `TENSORFOLD_CHAIN_RULE=cum MTP_DRAFTS=8` measured +1.4% on average, +5.5% for one stream writing code |
+ | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | default sampling (Qwen's thinking-mode values); a request's own values win |
+ | `THINKING` | `1` | open a think block by default; `0` answers directly unless a request asks to think |
+ | `MAX_TOKENS` | `32768` | reply length for a request without `max_tokens` (TensorFold's own default, 4,096, can end a thinking reply before it answers); clamped to the stream's window |
+@@ -325,6 +326,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
+ | Patch | Change |
+ | --- | --- |
+ | `0002-flash-next-v061` | Flash Next on v0.6.1: video input and up to 50 images sharing 16,384 tokens on top of TensorFold's own Flash Next image input (which came from this recipe's v0.6.0 vision patch), copy drafts with compact MTP rows, a `TENSORFOLD_PREFILL_ROWS` override, SSD read-ahead around the n-gram table, first token before the next draft, no unused MTP logits while prompts absorb, 96 MiB request bodies. Percentage effects in older notes were measured on v0.5.0, not on this pin. |
++| `0015-flash-next-chain-stop` | Where a round's MTP chain stops, `TENSORFOLD_CHAIN_RULE`: `conf` (the default, v0.6.1's rule: a draft under `MTP_CONFIDENCE` ends it) or `cum` (the chain stops once the chance that every draft so far lands, the product of their calibrated draft-head probabilities, falls under `TENSORFOLD_CHAIN_T`, default 0.30); `cost`, `adapt` and `acum` are experimental. Drafts change speed only. Needs 0012 and 0013 |
+ | `languages/0010-flash-next-draft-languages` | Opt-in language image only (`DRAFT_LANGUAGE`): language draft vocabularies for the MTP head. |
+ 
+ v0.6.1 brings, upstream: shared system prompts copied into a free stream instead of filled again (measured here: a 31k-token system prompt answered a new question in 0.18 s instead of 14 s), forks that resume from the shared prefix, short prompts admitted while a long one fills, `--vision-max-images`, vLLM-named `/metrics`, and the fix for a refused request breaking the next one on its connection. Its startup reserve is `TENSORFOLD_MEMORY_RESERVE_GIB` (this recipe sets 2). Live `/health` counters, stream draft stats, and tiled QSA selection landed in v0.5.0.
+@@ -350,6 +352,7 @@ from this machine or another one (`API_URL=http://<spark-address>:8888 tools/ben
+ | `tools/needle.py` | hides a passphrase in a ~195k-token prompt and checks the model returns it |
+ | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+ | `tools/visioncheck.py` | sends a drawn image (a red circle and a blue square) and checks the model names both |
++| `tools/chain_stop_check.py` | patch 0015's chain rules against reference implementations, and `_draft_all` with fake MTP steps (CPU) |
+ 
+ ## Repository layout
+ 
+diff --git a/patches/0015-flash-next-chain-stop.patch b/patches/0015-flash-next-chain-stop.patch
+new file mode 100644
+index 0000000..598cb6d
+--- /dev/null
++++ b/patches/0015-flash-next-chain-stop.patch
+@@ -0,0 +1,147 @@
++Where an MTP chain stops, by rule: TENSORFOLD_CHAIN_RULE (default conf, v0.6.1's rule; cum stops once the calibrated chance that every draft lands falls under TENSORFOLD_CHAIN_T).
++--- tensorfold/families/qwen4_exp/cuda/multi.py
+++++ tensorfold/families/qwen4_exp/cuda/multi.py
++@@ -35,6 +35,23 @@
++ COPY_MATCH = 8                   # copy drafts: the context's last this many tokens seen before, and as many after them
++ FILL_GUARD = 8                   # a prompt passed over this many passes takes the next one (no starvation), as on Macs
++ HINTS = os.environ.get("TENSORFOLD_PLE_HINTS", "1") != "0"   # the next round's n-gram rows read while the GPU drafts
+++# Where an MTP chain stops (drafts change speed only, never the reply's bits), TENSORFOLD_CHAIN_RULE:
+++#   "conf" (default): a draft under --mtp-confidence ends it, as v0.6.1;
+++#   "cum": the chance every draft so far lands (their calibrated probabilities' product) falls under TENSORFOLD_CHAIN_T;
+++#   "cost": a draft stays while its chance of landing buys more than a verify row, the chain goes on while the next
+++#     one's would also pay for an MTP step; "adapt" / "acum": "cost" / "cum" with each stream's own recent landing
+++#     rate scaling its drafts' calibrated chances.
+++# Measured on real prose and code at 1/2/4 streams: "cum" at 0.30 with --mtp-drafts 8.
+++CHAIN_RULE = os.environ.get("TENSORFOLD_CHAIN_RULE", "conf")
+++CHAIN_T = float(os.environ.get("TENSORFOLD_CHAIN_T", "0.30"))
+++ROW_MS = (3.1, 2.2)              # a verify row's cost at one stream and at four or more (measured on GB10)
+++MTP_MS = 1.4                     # an MTP step's cost (the draft head's 128 MB read dominates it)
+++# a draft's chance of landing given every earlier draft landed, by its draft-head probability: (probability, landing
+++# rate) points, linear between them and flat past the ends. Measured greedy on real prose and code, every chain run to
+++# depth 8 (4,935 tested drafts in bins of 0.05 holding 40 or more), fit monotone (pooled adjacent violators).
+++CAL = ((0.1304, 0.087), (0.1766, 0.1644), (0.2266, 0.1667), (0.2757, 0.2014), (0.3496, 0.2612), (0.4255, 0.277),
+++       (0.5026, 0.4088), (0.5757, 0.4759), (0.6267, 0.5128), (0.6982, 0.5813), (0.7753, 0.6597), (0.8522, 0.7105),
+++       (0.9268, 0.7479), (0.9932, 0.9507))
++ 
++ 
++ def _hinted(w) -> bool:
++@@ -115,6 +132,9 @@
++         # the next round's n-gram rows (its first token, then each draft) start reading on this thread as they are
++         # known, so the round's stage finds their pages cached; None: tables in memory, or hints off
++         self.hints = ThreadPoolExecutor(1, thread_name_prefix="ple-hint") if _hinted(w) else None
+++        self.chain_rule, self.chain_t = CHAIN_RULE, CHAIN_T
+++        self.tok_ms = None                               # round ms a token kept, all streams (the cost rule's value)
+++        self.verdict = None                              # verdict(stream, draft probabilities, drafts landed): a probe
++ 
++     def _busy(self) -> set[int]:
++         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
++@@ -536,6 +556,8 @@
++         for s, (_, tokens), (path, _) in zip(live, windows, paths):
++             if s.copies is not None:                     # the rows verified: a grammar may have cut some
++                 s.copies.landed(len(tokens), len(path))
+++        for s, (_, tokens), (path, _) in zip(live, windows, paths):
+++            self._landed(s, len(tokens) - 1, len(path) - 1)
++         for s, _, _, new, _ in kept:
++             if s.error is not None:
++                 s.done = True
++@@ -545,6 +567,9 @@
++         self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++         spent = time.perf_counter() - t0
++         self._timed(spent, sum(n for _, _, n in pieces))
+++        if not pieces:                                   # a decode round alone: ms a kept token, every stream's
+++            ms = 1e3 * spent / max(1, sum(len(new) for _, _, _, new, _ in kept))
+++            self.tok_ms = ms if self.tok_ms is None else 0.8 * self.tok_ms + 0.2 * ms
++         if pieces:                                     # prompts that ended in this round's pass join the next
++             ended += self._joined(pieces, heads, lasts, spent / len(pieces))
++         done = [s for s in live if s.done]
++@@ -557,7 +582,7 @@
++         the chains in one step a depth."""
++ 
++         for s, _, _ in streams:
++-            s.drafts = []
+++            s.drafts, s.draft_p, s.chain_q = [], [], 1.0
++         room = {s.sid: min(self.depth, s.count - len(s.out)) for s, _, _ in streams}
++         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
++         if not todo:
++@@ -580,16 +605,18 @@
++         if len(chains) < len(todo):                      # the logits of the streams that chain
++             logits = logits[chains]
++         active = [(todo[i][0], segs[i][2] - 1) for i in chains]
+++        n_live = len(self.streams)
++         for j in range(self.depth):
++             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
++             nxt, added = [], []
++             for (s, row), (d, p) in zip(active, picks):
++-                low = self.confidence > 0 and p < self.confidence
++-                if low and j > 0:
+++                keep, go = self._chain(s, j, p, room[s.sid], len(active), n_live)
+++                if not keep:
++                     continue
++                 s.drafts.append(d)
+++                s.draft_p.append(p)
++                 added.append((s, 1))
++-                if not low and j + 1 < room[s.sid]:
+++                if go:
++                     nxt.append((s, row, d))
++             if not nxt:
++                 self._hint(added)
++@@ -602,6 +629,59 @@
++                 s.st.set_mtp_len(s.st.mtp_len + 1)
++                 s.st.mtp_drafted += 1
++             active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
+++
+++    def _chain(self, s: Stream, j: int, p: float, room: int, chaining: int, live: int) -> tuple[bool, bool]:
+++        """Chain step ``j``'s draft of probability ``p``: (keep it, chain one more). The first draft is always kept,
+++        as in v0.6.1; a draft a rule drops ends its chain."""
+++
+++        rule = self.chain_rule
+++        if rule == "conf":
+++            low = self.confidence > 0 and p < self.confidence
+++            return not (low and j > 0), not low and j + 1 < room
+++        c = self._cal(p) * (getattr(s, "trust", 1.0) if rule in ("adapt", "acum") else 1.0)
+++        q = s.chain_q * min(1.0, c)                      # the chance this draft and every earlier one land
+++        if rule in ("cum", "acum"):
+++            keep = j == 0 or q >= self.chain_t
+++            if keep:
+++                s.chain_q = q
+++            return keep, keep and q >= self.chain_t and j + 1 < room
+++        tok = self.tok_ms
+++        if tok is None:                                  # no decode round timed yet: the confidence rule
+++            low = self.confidence > 0 and p < self.confidence
+++            return not (low and j > 0), not low and j + 1 < room
+++        f = min(1.0, max(0.0, (live - 1) / 3))
+++        row = ROW_MS[0] + (ROW_MS[1] - ROW_MS[0]) * f   # a verify row, interpolated by the live streams
+++        keep = j == 0 or q * tok >= row
+++        if keep:
+++            s.chain_q = q
+++        step = MTP_MS / max(1, chaining)                 # the next MTP step, shared by the streams still chaining
+++        return keep, keep and j + 1 < room and q * min(1.0, c) * tok >= step + row
+++
+++    @staticmethod
+++    def _cal(p: float) -> float:
+++        """A draft's chance of landing, given every earlier draft landed, by its draft-head probability (``CAL``)."""
+++
+++        if p <= CAL[0][0]:
+++            return CAL[0][1]
+++        for (p0, r0), (p1, r1) in zip(CAL, CAL[1:]):
+++            if p <= p1:
+++                return r0 + (r1 - r0) * (p - p0) / (p1 - p0)
+++        return CAL[-1][1]
+++
+++    def _landed(self, s: Stream, drafted: int, landed: int) -> None:
+++        """After a round's verify: ``landed`` of the ``drafted`` rows held. A chain's drafts tune the stream's trust
+++        (its landings over their calibrated chances, drafts up to the first miss); the probe sees every verdict."""
+++
+++        probs = getattr(s, "draft_p", [])[:drafted]
+++        if not probs:
+++            return
+++        if self.verdict is not None:
+++            self.verdict(s, list(probs), landed)
+++        seen = probs[:landed + 1]
+++        want = sum(self._cal(p) for p in seen)
+++        if want > 0:
+++            ratio = min(1.5, max(0.5, min(landed, len(seen)) / want))
+++            s.trust = 0.8 * getattr(s, "trust", 1.0) + 0.2 * ratio
++ 
++     def _hint(self, rows: list) -> None:
++         """Start the page reads of each (stream, last) pair's next-round rows: its window so far, the ``last`` final
+diff --git a/tools/chain_stop_check.py b/tools/chain_stop_check.py
+new file mode 100644
+index 0000000..88ef3bb
+--- /dev/null
++++ b/tools/chain_stop_check.py
+@@ -0,0 +1,256 @@
++#!/usr/bin/env python3
++"""tools/chain_stop_check.py: patch 0015 (where an MTP chain stops), CPU only, no model, in the image:
++
++    docker run --rm --entrypoint python3 -v "$PWD/tools:/t:ro" tensorfold-qwen38:v0.6.1 /t/chain_stop_check.py
++
++Checks `MultiDecoder`'s chain rules against reference implementations written here: the default rule is v0.6.1's
++(`conf`) and decides exactly as v0.6.1 does for every probability, depth and room; `_cal` is the `CAL` landing curve
++(its points, linear between them, flat past its ends); `cum` keeps the first draft and then drafts while the product
++of their calibrated chances stays at `TENSORFOLD_CHAIN_T` or above; `cost` / `adapt` / `acum` as documented;
++`_landed` feeds the probe and each stream's trust; `_draft_all`, driven with fake MTP steps, chains each stream as the
++rule says; the round reports drafted and landed rows to `_landed`. Prints PASS / FAIL lines and ALL PASS; exit 1 on any
++FAIL.
++"""
++from __future__ import annotations
++
++import ast
++import inspect
++import os
++import subprocess
++import sys
++import textwrap
++from types import SimpleNamespace as NS
++
++fails = 0
++
++
++def check(name, fn):
++    global fails
++    try:
++        ok, detail = fn()
++    except Exception as exc:                          # noqa: BLE001  (a broken rule is a FAIL, not a crash)
++        ok, detail = False, f"{type(exc).__name__}: {exc}"
++    print(("PASS " if ok else "FAIL ") + name + (f" ({detail})" if detail else ""), flush=True)
++    fails += not ok
++
++
++from tensorfold.families.qwen4_exp.cuda import multi as m  # noqa: E402
++
++M = m.MultiDecoder
++GRID = [i / 100 for i in range(0, 101)] + [0.1304, 0.9932, 0.5026, 1e-6, 0.999999]
++
++
++def settings():
++    env = {k: v for k, v in os.environ.items() if not k.startswith("TENSORFOLD_CHAIN")}
++    code = "from tensorfold.families.qwen4_exp.cuda import multi as m; print(m.CHAIN_RULE, m.CHAIN_T)"
++    plain = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True).stdout.split()
++    env.update(TENSORFOLD_CHAIN_RULE="cum", TENSORFOLD_CHAIN_T="0.25")
++    set_ = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True).stdout.split()
++    return plain == ["conf", "0.3"] and set_ == ["cum", "0.25"], f"default {plain}, with the settings {set_}"
++
++
++def decoder(rule="conf", t=0.30, confidence=0.6, tok_ms=None, depth=8):
++    d = object.__new__(M)
++    d.chain_rule, d.chain_t, d.confidence, d.tok_ms, d.depth, d.verdict = rule, t, confidence, tok_ms, depth, None
++    return d
++
++
++def cal_ref(p):
++    pts = m.CAL
++    if p <= pts[0][0]:
++        return pts[0][1]
++    for (p0, r0), (p1, r1) in zip(pts, pts[1:]):
++        if p <= p1:
++            return r0 + (r1 - r0) * (p - p0) / (p1 - p0)
++    return pts[-1][1]
++
++
++def conf_same():
++    bad = []
++    for conf in (0.0, 0.6, 0.7):
++        d = decoder("conf", confidence=conf)
++        for p in GRID:
++            for j in range(8):
++                for room in range(1, 9):
++                    low = conf > 0 and p < conf                  # v0.6.1's _draft_all, verbatim
++                    want = (not (low and j > 0), not low and j + 1 < room)
++                    s = NS(chain_q=1.0)
++                    if d._chain(s, j, p, room, 3, 4) != want:
++                        bad.append((conf, p, j, room))
++    return not bad, f"{len(GRID) * 8 * 8 * 3} decisions" + (f", differ at {bad[:3]}" if bad else "")
++
++
++def cal_curve():
++    knots = all(abs(M._cal(p) - r) < 1e-12 for p, r in m.CAL)
++    mids = all(abs(M._cal((p0 + p1) / 2) - (r0 + r1) / 2) < 1e-9 for (p0, r0), (p1, r1) in zip(m.CAL, m.CAL[1:]))
++    ends = M._cal(0.0) == m.CAL[0][1] and M._cal(1.0) == m.CAL[-1][1]
++    vals = [M._cal(p) for p in sorted(GRID)]
++    mono = all(a <= b + 1e-12 for a, b in zip(vals, vals[1:])) and all(0 <= v <= 1 for v in vals)
++    same = all(abs(M._cal(p) - cal_ref(p)) < 1e-12 for p in GRID)
++    return knots and mids and ends and mono and same, f"knots {knots}, midpoints {mids}, ends {ends}, monotone {mono}"
++
++
++def chain(d, ps, room, trust=None, chaining=1, live=1):
++    """Drive _chain as _draft_all does: the drafts kept, in order, until the rule ends the chain (the steps run to the
++    depth, len(ps); only the rule's answer keeps the chain within ``room``)."""
++    s = NS(chain_q=1.0)
++    if trust is not None:
++        s.trust = trust
++    kept = 0
++    for j, p in enumerate(ps):
++        keep, go = d._chain(s, j, p, room, chaining, live)
++        if not keep:
++            break
++        kept += 1
++        if not go:
++            break
++    return kept
++
++
++def cum_ref(ps, t, room, scale=1.0):
++    q, kept = 1.0, 0
++    for j, p in enumerate(ps[:room]):
++        q2 = q * min(1.0, cal_ref(p) * scale)
++        if not (j == 0 or q2 >= t):
++            break
++        q, kept = q2, kept + 1
++        if not (q2 >= t and j + 1 < room):
++            break
++    return kept
++
++
++def chains():
++    import random
++    rnd = random.Random(15)
++    return [[rnd.choice([rnd.random(), 0.9 + rnd.random() / 10, 0.99]) for _ in range(8)] for _ in range(400)] + \
++        [[0.99] * 8, [0.05] * 8, [0.99, 0.05, 0.99], [0.62] * 8]
++
++
++def cum_rule():
++    bad, total = [], 0
++    for t in (0.30, 0.15, 0.5):
++        d = decoder("cum", t=t)
++        for ps in chains():
++            for room in (1, 3, 8):
++                total += 1
++                if chain(d, ps, room) != cum_ref(ps, t, room):
++                    bad.append((t, room, ps[:3]))
++    first = all(chain(decoder("cum", t=0.99), [0.01] * 8, 8) == 1 for _ in range(1))
++    return not bad and first, f"{total} chains" + (f", differ at {bad[:2]}" if bad else "")
++
++
++def acum_rule():
++    bad, total = [], 0
++    for trust in (0.5, 1.0, 1.4):
++        d = decoder("acum", t=0.30)
++        for ps in chains():
++            total += 1
++            if chain(d, ps, 8, trust=trust) != cum_ref(ps, 0.30, 8, scale=trust):
++                bad.append((trust, ps[:3]))
++    return not bad, f"{total} chains, trust 0.5 / 1.0 / 1.4" + (f", differ at {bad[:2]}" if bad else "")
++
++
++def cost_rule():
++    bad, total = [], 0
++    for live in (1, 2, 4, 5):
++        for chaining in (1, 3):
++            for tok in (5.0, 12.0, 30.0):
++                d = decoder("cost", tok_ms=tok)
++                f = min(1.0, max(0.0, (live - 1) / 3))
++                row = m.ROW_MS[0] + (m.ROW_MS[1] - m.ROW_MS[0]) * f
++                for ps in chains()[:120]:
++                    q, want = 1.0, 0
++                    for j, p in enumerate(ps):
++                        c = min(1.0, cal_ref(p))
++                        q2 = q * c
++                        if not (j == 0 or q2 * tok >= row):
++                            break
++                        q, want = q2, want + 1
++                        if not (j + 1 < 8 and q2 * c * tok >= m.MTP_MS / chaining + row):
++                            break
++                    total += 1
++                    if chain(d, ps, 8, chaining=chaining, live=live) != want:
++                        bad.append((live, chaining, tok, ps[:3]))
++    untimed = decoder("cost", tok_ms=None)
++    fallback = all(untimed._chain(NS(chain_q=1.0), j, p, 8, 1, 1) == decoder("conf")._chain(NS(chain_q=1.0), j, p, 8, 1, 1)
++                   for p in GRID for j in range(4))
++    return not bad and fallback, f"{total} chains; untimed falls back to conf: {fallback}" + \
++        (f", differ at {bad[:2]}" if bad else "")
++
++
++def landed():
++    d = decoder("cum")
++    seen = []
++    d.verdict = lambda s, probs, n: seen.append((probs, n))
++    s = NS(draft_p=[0.9, 0.8, 0.4, 0.3], trust=1.0)
++    d._landed(s, 3, 1)                                # 3 drafted (the 4th never verified), 1 landed
++    want_ratio = min(1.5, max(0.5, 1 / (cal_ref(0.9) + cal_ref(0.8))))
++    ok1 = seen == [([0.9, 0.8, 0.4], 1)] and abs(s.trust - (0.8 + 0.2 * want_ratio)) < 1e-12
++    s2 = NS(draft_p=[0.99, 0.99], trust=1.0)
++    d._landed(s2, 2, 2)
++    ok2 = abs(s2.trust - (0.8 + 0.2 * min(1.5, 2 / (2 * cal_ref(0.99))))) < 1e-12
++    s3 = NS(draft_p=[], trust=0.7)
++    d._landed(s3, 0, 0)
++    ok3 = s3.trust == 0.7 and len(seen) == 2
++    return ok1 and ok2 and ok3, f"probe {seen[:1]}, trust {s.trust:.4f} / {s2.trust:.4f} / {s3.trust}"
++
++
++class State:
++    def __init__(self, pos):
++        self.pos, self.mtp_len, self.mtp_drafted = pos, pos, 0
++
++    def set_mtp_len(self, n):
++        self.mtp_len = n
++
++
++def draft_all():
++    """_draft_all over four streams under `cum` 0.30: fake MTP steps whose logits name the stream, picks scripted per
++    stream and depth; each stream's drafts and recorded probabilities must follow the rule (stream 4 has room for 3
++    tokens only), and a second round must start each chain afresh."""
++    probs = {1: [0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99], 2: [0.9, 0.62, 0.62, 0.62, 0.9, 0.9, 0.9, 0.9],
++             3: [0.3, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99], 4: [0.99] * 8}
++    count = {1: 100, 2: 100, 3: 100, 4: 4}
++    m.mtp_stage = lambda w, b, windows: [(st, i, i + len(keep)) for i, (st, keep, _) in enumerate(windows)]
++    d = decoder("cum", t=0.30, depth=8)
++    d.w, d.hints, d.chain_graphs = None, None, None
++    d.mbuf, d.buf = NS(streams=list(range(64))), NS(streams=list(range(64)))
++    d._mtp = lambda segs: [sid_of[id(st)] for st, _, _ in segs]
++    d._picks = lambda logits, positions, smp: [(100 * sid + (pos - st_of[sid].pos - 1), probs[sid][pos - st_of[sid].pos - 1])
++                                               for sid, pos in zip(logits, positions)]
++    streams = [NS(sid=i, st=State(40 + i), out=[7], count=count[i], copies=None, context=[], sampling=None,
++                  draft=True) for i in (1, 2, 3, 4)]
++    d.streams = {s.sid: s for s in streams}
++    sid_of = {id(s.st): s.sid for s in streams}
++    st_of = {s.sid: s.st for s in streams}
++    ok, got = True, []
++    for _ in range(2):
++        for s in streams:
++            s.st.mtp_drafted = 0
++        M._draft_all(d, [(s, 0, [7]) for s in streams])
++        for s in streams:
++            want = cum_ref(probs[s.sid], 0.30, min(8, s.count - len(s.out)))
++            ok &= s.drafts == [100 * s.sid + j for j in range(want)] and s.draft_p == probs[s.sid][:want]
++        got.append([len(s.drafts) for s in streams])
++    return ok and got[0] == got[1], f"drafts a stream {got}"
++
++
++def round_reports():
++    tree = ast.parse(textwrap.dedent(inspect.getsource(M.round)))
++    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
++             and n.func.attr == "_landed"]
++    want = ["s", "len(tokens) - 1", "len(path) - 1"]
++    got = [[ast.unparse(a) for a in c.args] for c in calls]
++    return got == [want], f"round calls _landed{got}"
++
++
++check("settings: TENSORFOLD_CHAIN_RULE defaults to conf, TENSORFOLD_CHAIN_T to 0.30, both read", settings)
++check("conf decides exactly as v0.6.1 (probabilities x depths x rooms x confidences)", conf_same)
++check("_cal is the CAL landing curve", cal_curve)
++check("cum: first draft kept, then drafts while the calibrated product stays >= T, within room", cum_rule)
++check("acum: cum with the stream's trust scaling each calibrated chance", acum_rule)
++check("cost: a draft stays while it buys a verify row, the chain goes on while the next pays an MTP step too", cost_rule)
++check("_landed: the probe sees drafted probabilities and landings; trust moves toward landed / expected", landed)
++check("_draft_all chains each stream by the rule and starts each round's chain afresh", draft_all)
++check("the round reports each stream's drafted and landed rows to _landed", round_reports)
++print("ALL PASS" if not fails else f"{fails} FAIL", flush=True)
++sys.exit(1 if fails else 0)

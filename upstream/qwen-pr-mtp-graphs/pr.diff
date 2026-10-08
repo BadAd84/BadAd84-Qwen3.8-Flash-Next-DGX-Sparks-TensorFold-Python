@@ -1,0 +1,435 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aa748de..8892a2c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,13 @@ release ends at is given, and the prebuilt images are
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- Decode (patch `0016-flash-next-mtp-graphs`): the MTP head's one-row chain steps replay as CUDA graphs
++  instead of ~40 launches from Python each. Per request: code 90.2 / 63.6 / 42.1 -> 91.3 / 64.5 / 42.4 tok/s at
++  1 / 2 / 4 streams, prose 74.6 / 51.0 / 32.2 -> 75.2 / 51.5 / 32.3; prefill unchanged; replies byte-identical.
++  Needs 0015.
++
+ ## [0.6.0] - 2026-10-02
+ 
+ Commit `22a3010` (#13). Images unchanged from 0.5.0.
+diff --git a/CREDITS.md b/CREDITS.md
+index fcdda76..7a1e265 100644
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -44,6 +44,7 @@ This repository is a thin layer of scripts and patches. Almost everything that m
+   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
+   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
+   built from each language's Wikipedia by token frequency.
++- `0016-flash-next-mtp-graphs` (the MTP chain steps as CUDA graphs): by [BadAd84](https://github.com/BadAd84).
+ 
+ ## Runtime stack
+ 
+diff --git a/README.md b/README.md
+index d32947c..50978e6 100644
+--- a/README.md
++++ b/README.md
+@@ -325,6 +325,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
+ | Patch | Change |
+ | --- | --- |
+ | `0002-flash-next-v061` | Flash Next on v0.6.1: video input and up to 50 images sharing 16,384 tokens on top of TensorFold's own Flash Next image input (which came from this recipe's v0.6.0 vision patch), copy drafts with compact MTP rows, a `TENSORFOLD_PREFILL_ROWS` override, SSD read-ahead around the n-gram table, first token before the next draft, no unused MTP logits while prompts absorb, 96 MiB request bodies. Percentage effects in older notes were measured on v0.5.0, not on this pin. |
++| `0016-flash-next-mtp-graphs` | The MTP head's chain steps (one row a stream) replay as CUDA graphs, keyed by the streams' MTP caches and a power-of-two context bucket (8,192 or more); a key is captured the second time it is seen, 32 graphs at most. A replay computes the eager step's bits. `TENSORFOLD_MTP_GRAPHS=0` runs them eagerly. Needs 0015 |
+ | `languages/0010-flash-next-draft-languages` | Opt-in language image only (`DRAFT_LANGUAGE`): language draft vocabularies for the MTP head. |
+ 
+ v0.6.1 brings, upstream: shared system prompts copied into a free stream instead of filled again (measured here: a 31k-token system prompt answered a new question in 0.18 s instead of 14 s), forks that resume from the shared prefix, short prompts admitted while a long one fills, `--vision-max-images`, vLLM-named `/metrics`, and the fix for a refused request breaking the next one on its connection. Its startup reserve is `TENSORFOLD_MEMORY_RESERVE_GIB` (this recipe sets 2). Live `/health` counters, stream draft stats, and tiled QSA selection landed in v0.5.0.
+@@ -350,6 +351,7 @@ from this machine or another one (`API_URL=http://<spark-address>:8888 tools/ben
+ | `tools/needle.py` | hides a passphrase in a ~195k-token prompt and checks the model returns it |
+ | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+ | `tools/visioncheck.py` | sends a drawn image (a red circle and a blue square) and checks the model names both |
++| `tools/mtp_graph_check.py` | patch 0016's graph keys, buckets, position uploads and limit, with CUDA graphs stood in for (CPU) |
+ 
+ ## Repository layout
+ 
+diff --git a/patches/0016-flash-next-mtp-graphs.patch b/patches/0016-flash-next-mtp-graphs.patch
+new file mode 100644
+index 0000000..177d11b
+--- /dev/null
++++ b/patches/0016-flash-next-mtp-graphs.patch
+@@ -0,0 +1,142 @@
++The MTP head's one-row-a-stream chain steps replayed as CUDA graphs (TENSORFOLD_MTP_GRAPHS=0 runs them eagerly).
++--- tensorfold/families/qwen4_exp/cuda/multi.py
+++++ tensorfold/families/qwen4_exp/cuda/multi.py
++@@ -4,6 +4,7 @@
++ 
++ import os
++ import time
+++from collections import OrderedDict
++ from concurrent.futures import ThreadPoolExecutor
++ 
++ import numpy as np
++@@ -52,6 +53,11 @@
++ CAL = ((0.1304, 0.087), (0.1766, 0.1644), (0.2266, 0.1667), (0.2757, 0.2014), (0.3496, 0.2612), (0.4255, 0.277),
++        (0.5026, 0.4088), (0.5757, 0.4759), (0.6267, 0.5128), (0.6982, 0.5813), (0.7753, 0.6597), (0.8522, 0.7105),
++        (0.9268, 0.7479), (0.9932, 0.9507))
+++# The MTP head's one-row-a-stream steps as CUDA graphs (``ChainGraphs``); TENSORFOLD_MTP_GRAPHS=0 runs them eagerly.
+++MTP_GRAPHS = os.environ.get("TENSORFOLD_MTP_GRAPHS", "1") != "0"
+++GRAPH_BUCKET = 8192              # the smallest context bucket a chain-step graph's sparse select covers
+++GRAPH_LIMIT = 32                 # chain-step graphs kept (the least recently replayed dropped past it)
+++SEEN_LIMIT = 4096                # keys counted before the count starts over
++ 
++ 
++ def _hinted(w) -> bool:
++@@ -83,6 +89,94 @@
++     e.buf, e.mbuf, e.pbuf, e.st, e.graphs = buf, mbuf, pbuf, st, None
++     e.stops = ()
++     return e
+++
+++
+++class ChainGraphs:
+++    """CUDA graphs of the MTP head's steps of one row a stream (every chain step after a round's absorb, and absorbs of
+++    one kept row). Eager, such a step's ~40 launches cost more host time than its GPU work and the GPU waited for each
+++    round trip; a replay launches it at once. Keyed by the stepping streams' MTP cache addresses (captured as the
+++    attention's pointer table) and a power-of-two context bucket: the sparse select is launched for every stream with
+++    the bucket as its context (its kernels read each row's real end from the device: extra blocks and chunks score,
+++    select and merge nothing), so a replay computes exactly what the eager step does. Per replay only the rows'
+++    positions are uploaded, one pinned copy. Drafts change speed only; these drafts are also the eager drafts' bits.
+++    A key is captured the second time it is seen (one-off sets of chaining streams stay eager) and the least recently
+++    replayed graph goes past ``GRAPH_LIMIT``."""
+++
+++    def __init__(self, md: "MultiDecoder") -> None:
+++        self.md = md
+++        self.graphs: OrderedDict = OrderedDict()    # key -> (graph, step, its ints, logits, pinned ints, copy event)
+++        self.seen: dict = {}                         # key -> eager steps so far (captured at the second)
+++        self.pool = torch.cuda.graph_pool_handle()
+++        self.captures = 0
+++
+++    @staticmethod
+++    def _key(segs: list, bucket: int) -> tuple:
+++        return (bucket, tuple((id(st), st.mtp_kc.k.data_ptr(), st.mtp_kc.v.data_ptr(), st.mtp_kc.ks.data_ptr(),
+++                               st.mtp_kc.vs.data_ptr(), st.mtp_ikc.data_ptr(), st.mtp_pooled.data_ptr(),
+++                               st.mtp_pos.data_ptr()) for st, _, _ in segs))
+++
+++    def run(self, segs: list) -> torch.Tensor | None:
+++        """The step's draft-head logits from a replay (captured on a key's second step), or None: run it eagerly."""
+++
+++        if any(a1 - a0 != 1 for _, a0, a1 in segs) or any(st.image_positions is not None for st, _, _ in segs):
+++            return None
+++        k = len(segs)
+++        end = max(st.mtp_len + 1 for st, _, _ in segs)
+++        bucket = max(GRAPH_BUCKET, 1 << (end - 1).bit_length())
+++        key = self._key(segs, bucket)
+++        hit = self.graphs.get(key)
+++        if hit is not None:
+++            g, _, ints, out, host, done = hit
+++            self.graphs.move_to_end(key)
+++            done.synchronize()                       # the previous replay's table copy has left the pinned buffer
+++            vals = host.numpy()
+++            for i, (st, _, _) in enumerate(segs):
+++                vals[i] = vals[2 * k + i] = st.mtp_len   # posr and first: one row a stream, at its MTP length
+++            ints.copy_(host, non_blocking=True)
+++            done.record()
+++            g.replay()
+++            return out
+++        if len(self.seen) > SEEN_LIMIT:
+++            self.seen.clear()
+++        self.seen[key] = self.seen.get(key, 0) + 1
+++        if self.seen[key] < 2:
+++            return None
+++        while len(self.graphs) >= GRAPH_LIMIT:
+++            self.graphs.popitem(last=False)
+++        md = self.md
+++        step = attn_multi.Step(md.w, segs, mtp=True)
+++        host = torch.cat([step.posr, step.sid, step.first, step.counts]).cpu().pin_memory()
+++        ints = host.to(md.w.device)
+++        step.posr, step.sid, step.first, step.counts = ints[:k], ints[k:2 * k], ints[2 * k:3 * k], ints[3 * k:]
+++        step.ends = [bucket] * k
+++        md.mbuf.attn_step = step
+++        try:
+++            out = mtp_compute(md.w, segs, md.mbuf)        # this step's result, and every launch shape compiled
+++            g = self._capture(lambda: mtp_compute(md.w, segs, md.mbuf))
+++        finally:
+++            md.mbuf.attn_step = None
+++        done = torch.cuda.Event()
+++        done.record()
+++        self.graphs[key] = (g, step, ints, out, host, done)   # the step keeps its captured tables alive
+++        return out
+++
+++    def _capture(self, fn) -> torch.cuda.CUDAGraph:
+++        import gc
+++
+++        torch.cuda.synchronize()
+++        g = torch.cuda.CUDAGraph()
+++        enabled = gc.isenabled()                     # collecting an old graph mid-capture invalidates the capture
+++        gc.disable()
+++        try:
+++            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
+++                fn()
+++        finally:
+++            if enabled:
+++                gc.enable()
+++        torch.cuda.synchronize()
+++        self.captures += 1
+++        return g
+++
++ 
++ 
++ class MultiDecoder:
++@@ -135,6 +229,7 @@
++         self.chain_rule, self.chain_t = CHAIN_RULE, CHAIN_T
++         self.tok_ms = None                               # round ms a token kept, all streams (the cost rule's value)
++         self.verdict = None                              # verdict(stream, draft probabilities, drafts landed): a probe
+++        self.chain_graphs = ChainGraphs(self) if MTP_GRAPHS and self.mbuf is not None else None
++ 
++     def _busy(self) -> set[int]:
++         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
++@@ -693,8 +788,13 @@
++                                if s.st.ple_history is not None])
++ 
++     def _mtp(self, segs: list) -> torch.Tensor:
++-        """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
++-
+++        """An MTP step over every drafting stream, its attention one launch a kernel for all of them (a CUDA graph's
+++        replay when every stream steps one row: ``ChainGraphs``)."""
+++
+++        if self.chain_graphs is not None:
+++            out = self.chain_graphs.run(segs)
+++            if out is not None:
+++                return out
++         self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
++         try:
++             return mtp_compute(self.w, segs, self.mbuf)
+diff --git a/tools/mtp_graph_check.py b/tools/mtp_graph_check.py
+new file mode 100644
+index 0000000..20c8938
+--- /dev/null
++++ b/tools/mtp_graph_check.py
+@@ -0,0 +1,231 @@
++#!/usr/bin/env python3
++"""tools/mtp_graph_check.py: patch 0016 (the MTP head's chain steps as CUDA graphs), CPU only, no model, in the image:
++
++    docker run --rm --entrypoint python3 -v "$PWD/tools:/t:ro" tensorfold-qwen38:v0.6.1 /t/mtp_graph_check.py
++
++`ChainGraphs.run`'s bookkeeping, on the CPU: CUDA graphs are stood in for by recorders whose replay re-runs the
++captured kernel on the tensors it captured (as a replay does), and `mtp_compute` by a kernel that writes each row's
++"logits" from the step's position tables on the device side, and marks a row whose real end lies past the step's
++context. The patch's own `attn_multi.Step` builds the tables. Checks: a step is eager the first time its key is seen and
++a replay afterwards; every replay computes what an eager step would for the streams' current positions (the positions
++and block starts uploaded, the context bucket a power of two >= 8192 covering every row, a new bucket a new key);
++steps of more than one row a stream and image streams stay eager; at most 32 graphs, the least recently replayed
++dropped; `MultiDecoder._mtp` replays through it, else runs the eager step and clears its tables; and
++`TENSORFOLD_MTP_GRAPHS=0` turns it off. That a replay's GPU kernels give the eager step's bits is measured on the GPU,
++not here. Prints PASS / FAIL lines and ALL PASS; exit 1 on any FAIL.
++"""
++from __future__ import annotations
++
++import contextlib
++import os
++import subprocess
++import sys
++from types import SimpleNamespace as NS
++
++import torch
++
++fails = 0
++
++
++def check(name, fn):
++    global fails
++    try:
++        ok, detail = fn()
++    except Exception as exc:                          # noqa: BLE001  (a missing or broken piece is a FAIL)
++        ok, detail = False, f"{type(exc).__name__}: {exc}"
++    print(("PASS " if ok else "FAIL ") + name + (f" ({detail})" if detail else ""), flush=True)
++    fails += not ok
++
++
++# --- CUDA stand-ins: a graph records the kernels launched while it captures and re-runs them at each replay
++CAPTURING: list = []
++
++
++class Graph:
++    def __init__(self):
++        self.kernels, self.replays = [], 0
++
++    def replay(self):
++        self.replays += 1
++        for k in self.kernels:
++            k()
++
++
++@contextlib.contextmanager
++def graph(g, pool=None, capture_error_mode=None):
++    CAPTURING.append(g)
++    try:
++        yield
++    finally:
++        CAPTURING.pop()
++
++
++class Event:
++    def record(self):
++        pass
++
++    def synchronize(self):
++        pass
++
++
++class Pinned(torch.Tensor):
++    """Pinned host memory: ``.to(device)`` is a separate copy, as on a GPU (a CPU tensor's ``.to("cpu")`` is itself)."""
++
++    def to(self, *a, **k):
++        return self.as_subclass(torch.Tensor).clone()
++
++
++torch.cuda.CUDAGraph, torch.cuda.graph, torch.cuda.Event = Graph, graph, Event
++torch.cuda.graph_pool_handle = lambda: "pool"
++torch.cuda.synchronize = lambda *a, **k: None
++torch.Tensor.pin_memory = lambda self, *a, **k: self.as_subclass(Pinned)
++
++from tensorfold.families.qwen4_exp.cuda import multi as m  # noqa: E402
++
++LAUNCHES = [0]
++
++
++def mtp_compute(w, segs, b, **kw):
++    """The step's 'kernel': logits[i] = position * 1000 + block start, + 10^6 where the row's end passes the step's
++    context; the step's tables are the ones on b.attn_step when it launches (captured with it)."""
++    step, k = b.attn_step, len(segs)
++    out = b.logits[:k]
++
++    def kernel():
++        LAUNCHES[0] += 1
++        ends = torch.tensor(step.ends[:k], dtype=torch.int64)
++        out.copy_(step.posr[:k].long() * 1000 + step.first[:k].long() + 10**6 * (step.posr[:k].long() + 1 > ends))
++
++    if CAPTURING:
++        CAPTURING[-1].kernels.append(kernel)
++    else:
++        kernel()
++    return out
++
++
++m.mtp_compute = mtp_compute
++
++
++class St:
++    def __init__(self, n):
++        self.mtp_kc = NS(k=torch.zeros(1), v=torch.zeros(1), ks=torch.zeros(1), vs=torch.zeros(1))
++        self.mtp_ikc, self.mtp_pooled, self.mtp_pos = torch.zeros(1), torch.zeros(1), torch.zeros(1)
++        self.mtp_len, self.image_positions, self.pos = n, None, n
++        self.pos_dev, self.rope_delta_dev = torch.zeros(1), torch.zeros(1)
++
++
++def md():
++    d = object.__new__(m.MultiDecoder)
++    d.w = NS(device=torch.device("cpu"), layers=[], mtp=NS(layer=NS(index=0, linear=False)))
++    d.mbuf = NS(logits=torch.zeros(64, dtype=torch.int64), attn_step=None)
++    return d
++
++
++def segs_of(sts, rows=1):
++    return [(st, i * rows, i * rows + rows) for i, st in enumerate(sts)]
++
++
++def want(sts):
++    return [st.mtp_len * 1001 for st in sts]
++
++
++def chain():
++    """Three streams step from MTP length 100 to 3000 (one key: the 8192 bucket), then two of them on past 8192."""
++    d = md()
++    cg = m.ChainGraphs(d)
++    sts = [St(100), St(1500), St(40)]
++    first = cg.run(segs_of(sts)) is None
++    bad, eager = [], 0
++    for step in range(2900):
++        for st in sts:
++            st.mtp_len += 1
++        out = cg.run(segs_of(sts))
++        if out is None:
++            eager += 1
++        elif out.tolist() != want(sts):
++            bad.append((step, out.tolist(), want(sts)))
++    replays = sum(g.replays for g, *_ in cg.graphs.values())
++    two = sts[1:]
++    for st in two:
++        st.mtp_len = 8100
++    crossed = 0
++    for step in range(200):                           # 8101 .. 8300: the 8192 bucket, then the 16384 one
++        for st in two:
++            st.mtp_len += 1
++        before = sum(g.replays for g, *_ in cg.graphs.values())
++        out = cg.run(segs_of(two))
++        if out is not None and out.tolist() != want(two):
++            bad.append(("past 8192", out.tolist()[:2], want(two)))
++        if sum(g.replays for g, *_ in cg.graphs.values()) > before and max(st.mtp_len for st in two) + 1 > 8192:
++            crossed += 1
++    keys = sorted(k[0] for k in cg.graphs)
++    ok = first and eager == 0 and replays == 2899 and not bad and crossed > 50 and keys == [8192, 8192, 16384]
++    return ok, f"first sight eager {first}; then {replays} replays, {eager} more eager steps; {crossed} replays " \
++        f"past 8192; graphs' buckets {keys}; wrong {bad[:2]}"
++
++
++def eager_only():
++    d = md()
++    cg = m.ChainGraphs(d)
++    sts = [St(10), St(20)]
++    multi = [cg.run(segs_of(sts, rows=2)) for _ in range(3)]
++    img, other = St(30), St(5)
++    img.image_positions = torch.zeros(3)
++    image = [cg.run(segs_of([img, other])) for _ in range(3)]
++    return all(x is None for x in multi + image) and not cg.graphs, \
++        f"two rows a stream {multi}, an image stream {image}"
++
++
++def limit():
++    d = md()
++    cg = m.ChainGraphs(d)
++    sets = [[St(100 + i)] for i in range(m.GRAPH_LIMIT + 1)]
++    for s in sets[:m.GRAPH_LIMIT]:                    # 32 graphs: each key seen twice
++        cg.run(segs_of(s))
++        cg.run(segs_of(s))
++    cg.run(segs_of(sets[0]))                          # the first is replayed again: the second is now the oldest
++    cg.run(segs_of(sets[-1]))
++    cg.run(segs_of(sets[-1]))                         # a 33rd graph
++    held = {k[1][0][0] for k in cg.graphs}
++    ok = m.GRAPH_LIMIT == 32 and len(cg.graphs) == 32 and id(sets[1][0]) not in held and id(sets[0][0]) in held \
++        and id(sets[-1][0]) in held
++    return ok, f"{len(cg.graphs)} graphs, the least recently replayed dropped {id(sets[1][0]) not in held}, " \
++        f"the replayed one kept {id(sets[0][0]) in held}"
++
++
++def through_mtp():
++    d = md()
++    d.chain_graphs = m.ChainGraphs(d)
++    sts = [St(500), St(900)]
++    outs = []
++    for _ in range(4):
++        for st in sts:
++            st.mtp_len += 1
++        outs.append(m.MultiDecoder._mtp(d, segs_of(sts)).tolist() == want(sts))
++    replayed = sum(g.replays for g, *_ in d.chain_graphs.graphs.values())
++    cleared = d.mbuf.attn_step is None
++    d.chain_graphs = None
++    eager = m.MultiDecoder._mtp(d, segs_of(sts, rows=1)).tolist() == want(sts) and d.mbuf.attn_step is None
++    return all(outs) and replayed == 2 and cleared and eager, \
++        f"steps right {outs}, replays {replayed}, tables cleared {cleared}, eager without graphs {eager}"
++
++
++def switch():
++    code = "from tensorfold.families.qwen4_exp.cuda import multi as m; print(m.MTP_GRAPHS)"
++    env = {k: v for k, v in os.environ.items() if k != "TENSORFOLD_MTP_GRAPHS"}
++    on = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True).stdout.strip()
++    off = subprocess.run([sys.executable, "-c", code], env={**env, "TENSORFOLD_MTP_GRAPHS": "0"},
++                         capture_output=True, text=True).stdout.strip()
++    built = "ChainGraphs(self) if MTP_GRAPHS and self.mbuf is not None else None" in \
++        __import__("inspect").getsource(m.MultiDecoder.__init__)
++    return on == "True" and off == "False" and built, f"default {on}, TENSORFOLD_MTP_GRAPHS=0 {off}, wired {built}"
++
++
++check("one key from MTP length 100 to 3000: eager at first sight, then replays computing the current positions; "
++      "a new bucket past 8192", chain)
++check("steps of two rows a stream, and image streams, stay eager", eager_only)
++check("at most 32 graphs; the least recently replayed goes first", limit)
++check("MultiDecoder._mtp replays through ChainGraphs, else steps eagerly; the step's tables are cleared", through_mtp)
++check("TENSORFOLD_MTP_GRAPHS=0 turns the graphs off", switch)
++print("ALL PASS" if not fails else f"{fails} FAIL", flush=True)
++sys.exit(1 if fails else 0)

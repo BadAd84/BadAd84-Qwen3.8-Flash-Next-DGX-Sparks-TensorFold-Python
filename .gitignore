@@ -1,0 +1,12 @@
+# secrets - never commit real env
+.env
+**/.env
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# model tensors and traces - keep out of git
+*.pt
+*.safetensors

@@ -1,0 +1,334 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aa748de..30f8f07 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,13 @@ release ends at is given, and the prebuilt images are
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- Decode (patch `0017-flash-next-ple-defer`): a round's n-gram rows are read while the GPU runs the layers
++  before the n-gram layer. With 0016, per request: code 91.3 / 64.5 / 42.4 -> 92.1 / 64.9 / 42.9 tok/s at
++  1 / 2 / 4 streams, prose 75.2 / 51.5 / 32.3 -> 76.0 / 51.9 / 32.9; prefill unchanged; replies
++  byte-identical. Needs 0016.
++
+ ## [0.6.0] - 2026-10-02
+ 
+ Commit `22a3010` (#13). Images unchanged from 0.5.0.
+diff --git a/CREDITS.md b/CREDITS.md
+index fcdda76..af148bd 100644
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -44,6 +44,7 @@ This repository is a thin layer of scripts and patches. Almost everything that m
+   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
+   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
+   built from each language's Wikipedia by token frequency.
++- `0017-flash-next-ple-defer` (the n-gram rows read during the layers before them): by [BadAd84](https://github.com/BadAd84).
+ 
+ ## Runtime stack
+ 
+diff --git a/README.md b/README.md
+index d32947c..7ad66e4 100644
+--- a/README.md
++++ b/README.md
+@@ -325,6 +325,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
+ | Patch | Change |
+ | --- | --- |
+ | `0002-flash-next-v061` | Flash Next on v0.6.1: video input and up to 50 images sharing 16,384 tokens on top of TensorFold's own Flash Next image input (which came from this recipe's v0.6.0 vision patch), copy drafts with compact MTP rows, a `TENSORFOLD_PREFILL_ROWS` override, SSD read-ahead around the n-gram table, first token before the next draft, no unused MTP logits while prompts absorb, 96 MiB request bodies. Percentage effects in older notes were measured on v0.5.0, not on this pin. |
++| `0017-flash-next-ple-defer` | A decode round's n-gram rows are looked up, read and copied when the forward reaches its n-gram layer, while the GPU runs the layers before it: the same bytes in the same buffers ahead of the same kernels. A round that shares its forward with a prompt pass stages them first, as before. `TENSORFOLD_PLE_DEFER=0` always stages them first. Needs 0016 |
+ | `languages/0010-flash-next-draft-languages` | Opt-in language image only (`DRAFT_LANGUAGE`): language draft vocabularies for the MTP head. |
+ 
+ v0.6.1 brings, upstream: shared system prompts copied into a free stream instead of filled again (measured here: a 31k-token system prompt answered a new question in 0.18 s instead of 14 s), forks that resume from the shared prefix, short prompts admitted while a long one fills, `--vision-max-images`, vLLM-named `/metrics`, and the fix for a refused request breaking the next one on its connection. Its startup reserve is `TENSORFOLD_MEMORY_RESERVE_GIB` (this recipe sets 2). Live `/health` counters, stream draft stats, and tiled QSA selection landed in v0.5.0.
+@@ -350,6 +351,7 @@ from this machine or another one (`API_URL=http://<spark-address>:8888 tools/ben
+ | `tools/needle.py` | hides a passphrase in a ~195k-token prompt and checks the model returns it |
+ | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+ | `tools/visioncheck.py` | sends a drawn image (a red circle and a blue square) and checks the model names both |
++| `tools/ple_defer_check.py` | patch 0017's deferred staging: the n-gram layer's first kernel sees the bytes an immediate staging puts there (CPU, kernels stood in for) |
+ 
+ ## Repository layout
+ 
+diff --git a/patches/0017-flash-next-ple-defer.patch b/patches/0017-flash-next-ple-defer.patch
+new file mode 100644
+index 0000000..31e5c8e
+--- /dev/null
++++ b/patches/0017-flash-next-ple-defer.patch
+@@ -0,0 +1,100 @@
++A decode round's n-gram rows read when the forward reaches its first n-gram layer, while the GPU runs the layers before it (TENSORFOLD_PLE_DEFER=0 stages them first, as v0.6.1).
++--- tensorfold/families/qwen4_exp/cuda/forward.py
+++++ tensorfold/families/qwen4_exp/cuda/forward.py
++@@ -2,6 +2,7 @@
++ 
++ from __future__ import annotations
++ 
+++import functools
++ from dataclasses import dataclass
++ from typing import Sequence
++ 
++@@ -266,8 +267,14 @@
++ 
++ 
++ def ple_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int) -> None:
++-    """h += the n-gram embedding branch, each stream through its own conv tail (rows staged by ``stage``)."""
++-
+++    """h += the n-gram embedding branch, each stream through its own conv tail (rows staged by ``stage``, or here
+++    when ``stage`` deferred them: ``b.ple_staging``)."""
+++
+++    staging = getattr(b, "ple_staging", None)
+++    if staging is not None:                          # the GPU ran the layers before this one while the rows were read
+++        b.ple_staging = None
+++        staging()
+++        b.staged.record()                            # the pinned buffers are in use until these copies land
++     c = w.cfg
++     p = layer.ple
++     assert p is not None                             # ple_block only runs on a layer that carries one
++@@ -439,8 +446,12 @@
++     w.comm.all_gather(c, b.cand_all[:b.world * R * (2 * CAND + 1)])
++ 
++ 
++-def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]) -> list[Seg]:
++-    """Host work before a forward (token ids, n-gram rows into static buffers); returns each stream's segment."""
+++def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]], *,
+++          defer_ple: bool = False) -> list[Seg]:
+++    """Host work before a forward (token ids, n-gram rows into static buffers); returns each stream's segment.
+++    ``defer_ple``: the n-gram rows are looked up and copied when the forward reaches its first n-gram layer
+++    (``ple_block`` runs ``b.ple_staging``), so the GPU runs the layers before it meanwhile: the same bytes in the
+++    same buffers ahead of the same kernels on the stream."""
++ 
++     segs: list[Seg] = []
++     for st, tokens in windows:
++@@ -454,6 +465,17 @@
++     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
++     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
++     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
+++    if defer_ple and any(layer.ple is not None for layer in w.layers):
+++        b.ple_staging = functools.partial(_stage_ple, w, b, list(windows), segs)
+++    else:
+++        _stage_ple(w, b, windows, segs)
+++    b.staged.record()
+++    return segs
+++
+++
+++def _stage_ple(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]], segs: list[Seg]) -> None:
+++    """Each n-gram layer's rows of the windows' tokens into the staging buffers (and their copies to the GPU)."""
+++
++     for layer in w.layers:
++         if layer.ple is not None:
++             p = layer.ple
++@@ -467,8 +489,6 @@
++                     stage_ple(p.table, w.x3, ids, at=a0 * (ids.size // len(toks)))
++                 else:
++                     stage_ple_rows(p, b, ids, at=a0 * (ids.size // len(toks)))       # ids [rows, heads]
++-    b.staged.record()
++-    return segs
++ 
++ 
++ def read_ahead(w: Weights, history: np.ndarray, tokens: Sequence[int]) -> None:
++--- tensorfold/families/qwen4_exp/cuda/multi.py
+++++ tensorfold/families/qwen4_exp/cuda/multi.py
++@@ -36,6 +36,7 @@
++ COPY_MATCH = 8                   # copy drafts: the context's last this many tokens seen before, and as many after them
++ FILL_GUARD = 8                   # a prompt passed over this many passes takes the next one (no starvation), as on Macs
++ HINTS = os.environ.get("TENSORFOLD_PLE_HINTS", "1") != "0"   # the next round's n-gram rows read while the GPU drafts
+++PLE_DEFER = os.environ.get("TENSORFOLD_PLE_DEFER", "1") != "0"   # a decode round's n-gram rows read during its layers 0-1
++ # Where an MTP chain stops (drafts change speed only, never the reply's bits), TENSORFOLD_CHAIN_RULE:
++ #   "conf" (default): a draft under --mtp-confidence ends it, as v0.6.1;
++ #   "cum": the chance every draft so far lands (their calibrated probabilities' product) falls under TENSORFOLD_CHAIN_T;
++@@ -595,7 +596,9 @@
++             return failed + ended
++         t0 = time.perf_counter()
++         windows = [(s.st, [s.out[-1]] + list(s.drafts)) for s in live]
++-        segs = stage(self.w, self.buf, windows)
+++        # a decode round alone stages its n-gram rows once the forward reaches the n-gram layer: the GPU runs the
+++        # layers before it meanwhile (ple-defer; a round with a prompt pass stages them here, as v0.6.1)
+++        segs = stage(self.w, self.buf, windows, defer_ple=PLE_DEFER and not (self.filling and self.converged))
++         # a pass shares the round's forward only where their experts share a launch; else _fill ran it between rounds
++         pieces, psegs = (self._pieces(self._pass_rows()) if self.filling and self.converged else []), None
++         cuts = []
++@@ -619,7 +622,7 @@
++             else:
++                 logits = compute(self.w, segs, self.buf)
++         finally:
++-            self.buf.gdn_tables = self.buf.attn_step = None
+++            self.buf.gdn_tables = self.buf.attn_step = self.buf.ple_staging = None
++         lasts = self._absorb(pieces, psegs, cuts) if pieces else None
++         starts = [a0 for _, a0, _ in segs] + [segs[-1][2]]
++         for s, (_, a0, a1) in zip(live, segs):
+diff --git a/tools/ple_defer_check.py b/tools/ple_defer_check.py
+new file mode 100644
+index 0000000..ea03c32
+--- /dev/null
++++ b/tools/ple_defer_check.py
+@@ -0,0 +1,172 @@
++#!/usr/bin/env python3
++"""tools/ple_defer_check.py: patch 0017 (a decode round's n-gram rows staged when the forward reaches the n-gram
++layer), CPU only, no model, in the image:
++
++    docker run --rm --entrypoint python3 -v "$PWD/tools:/t:ro" tensorfold-qwen38:v0.6.1 /t/ple_defer_check.py
++
++Runs the patch's own `forward.stage` and `forward.ple_block` on CPU buffers with a fake n-gram table, the GPU kernels
++stood in for by recorders that copy the staged buffers at each launch. Checks: with `defer_ple` the n-gram rows are
++not staged by `stage` but by `ple_block`, before its first kernel, and the stream's event is recorded after their
++copies; the kernels then see exactly the bytes an immediate staging puts there (and each stream's `ple_last` is the
++same); without `defer_ple`, or with no n-gram layer, `stage` stages them as v0.6.1 does; the decode round defers only
++when no prompt pass shares its forward, and clears a deferred staging when its forward ends; `TENSORFOLD_PLE_DEFER=0`
++turns it off. Prints PASS / FAIL lines and ALL PASS; exit 1 on any FAIL.
++"""
++from __future__ import annotations
++
++import ast
++import inspect
++import os
++import subprocess
++import sys
++import textwrap
++from types import SimpleNamespace as NS
++
++import numpy as np
++import torch
++
++fails = 0
++
++
++def check(name, fn):
++    global fails
++    try:
++        ok, detail = fn()
++    except Exception as exc:                          # noqa: BLE001  (a missing or broken piece is a FAIL)
++        ok, detail = False, f"{type(exc).__name__}: {exc}"
++    print(("PASS " if ok else "FAIL ") + name + (f" ({detail})" if detail else ""), flush=True)
++    fails += not ok
++
++
++from tensorfold.families.qwen4_exp.cuda import forward as fw  # noqa: E402
++
++HEADS, W, G = 4, 8, 2                                 # n-gram heads, words and scales a row (a small table)
++LOG: list = []                                        # (event) in launch order
++
++
++class Recorder:
++    """The glue kernels and matmuls: each launch logs its name and the staged words it would read."""
++
++    def __init__(self, b):
++        self.b = b
++
++    def __getattr__(self, name):
++        def launch(*a, **k):
++            LOG.append((name, self.b.ple_w.clone(), self.b.ple_s.clone(), self.b.ple_b.clone()))
++        return launch
++
++
++class Event:
++    def synchronize(self):
++        LOG.append(("synchronize",))
++
++    def record(self):
++        LOG.append(("record",))
++
++
++class Table:
++    def gather(self, ids):
++        ids = np.asarray(ids, dtype=np.int64).reshape(-1)
++        words = (ids[:, None] * 31 + np.arange(W)).astype(np.uint32)
++        scales = (ids[:, None] * 7 + np.arange(G)).astype(np.uint16)
++        return words, scales, (scales + 3).astype(np.uint16)
++
++
++def ngram_ids(history, toks):
++    return (np.asarray(toks, dtype=np.int64)[:, None] * 10 + np.arange(HEADS) + int(history[0])) % 1000
++
++
++def setup(ple=True):
++    rows = 16
++    b = NS(rows=rows, staged=Event(), ids_host=torch.zeros(rows, dtype=torch.int32), ids=torch.zeros(rows, dtype=torch.int32),
++           ple_hw=torch.zeros(rows * HEADS, W, dtype=torch.int32), ple_hs=torch.zeros(rows * HEADS, G, dtype=torch.int16),
++           ple_hb=torch.zeros(rows * HEADS, G, dtype=torch.int16),
++           ple_w=torch.full((rows * HEADS, W), -1, dtype=torch.int32),
++           ple_s=torch.zeros(rows * HEADS, G, dtype=torch.bfloat16), ple_b=torch.zeros(rows * HEADS, G, dtype=torch.bfloat16))
++    for name in ("ple_emb", "xs_ple", "ple_keys", "ple_vals", "h", "ple_gated", "ple_pss", "ple_nrow"):
++        setattr(b, name, torch.zeros(rows, 2))
++    p = NS(table=Table(), ngram=NS(ids=ngram_ids, heads=HEADS, dims=W), key=None, value=None, norm_key=None,
++           norm_query=None, norm_conv=None, conv=None)
++    layers = [NS(ple=None), NS(ple=None), NS(ple=p if ple else None), NS(ple=None)]
++    w = NS(x3=None, layers=layers, cfg=NS(eps=1e-6, streams=4, ngram_size=3))
++    sts = [NS(pos=10 * i, capacity=4096, ple_history=np.array([i * 100]), ple_tail=None) for i in (1, 2, 3)]
++    windows = [(sts[0], [5, 6, 7]), (sts[1], [8]), (sts[2], [9, 10, 11, 12])]
++    fw.glue = Recorder(b)
++    fw._mm = Recorder(b).mm
++    return w, b, windows, p, layers
++
++
++def immediate():
++    w, b, windows, _, _ = setup()
++    LOG.clear()
++    segs = fw.stage(w, b, windows)
++    staged = (b.ple_w.clone(), b.ple_s.clone(), b.ple_b.clone())
++    rec_after = [e[0] for e in LOG] == ["synchronize", "record"]
++    lasts = [st.ple_last[1].tolist() for st, _ in windows]
++    return staged, segs, rec_after and getattr(b, "ple_staging", None) is None, lasts
++
++
++def deferred():
++    REF, _, plain_ok, ref_lasts = immediate()
++    w, b, windows, p, layers = setup()
++    LOG.clear()
++    segs = fw.stage(w, b, windows, defer_ple=True)
++    untouched = bool((b.ple_w == -1).all()) and getattr(b, "ple_staging", None) is not None
++    LOG.clear()
++    R = segs[-1][2]
++    fw.ple_block(layers[2], w, segs, b, R)
++    kernels = [e for e in LOG if len(e) == 4]
++    first = kernels[0] if kernels else None
++    seen = first is not None and all(torch.equal(x, y) for x, y in zip(first[1:], REF))
++    names = [e[0] for e in LOG]
++    order = "record" in names and kernels and names.index("record") < names.index(kernels[0][0])
++    cleared = getattr(b, "ple_staging", None) is None
++    lasts = [st.ple_last[1].tolist() for st, _ in windows]
++    ok = plain_ok and untouched and seen and order and cleared and lasts == ref_lasts and int(REF[0][0, 0]) != -1
++    return ok, f"stage left the buffers alone {untouched}; the first kernel ({first[0] if first else None}) saw the " \
++        f"immediate staging's bytes {seen}; event recorded before it {bool(order)}; cleared {cleared}; v0.6.1 path " \
++        f"stages in stage {plain_ok}"
++
++
++def no_ple():
++    w, b, windows, _, _ = setup(ple=False)
++    segs = fw.stage(w, b, windows, defer_ple=True)
++    return getattr(b, "ple_staging", None) is None and segs[-1][2] == 8, "no n-gram layer: nothing deferred"
++
++
++def round_wiring():
++    from tensorfold.families.qwen4_exp.cuda import multi as m
++
++    tree = ast.parse(textwrap.dedent(inspect.getsource(m.MultiDecoder.round)))
++    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "stage"
++                and ast.unparse(n.args[1]) == "self.buf")
++    kw = next(k.value for k in call.keywords if k.arg == "defer_ple")
++    expr = compile(ast.Expression(kw), "defer_ple", "eval")
++    table = {(d, f, c): eval(expr, {"PLE_DEFER": d, "self": NS(filling=f, converged=c)})
++             for d in (True, False) for f in ((), (1,)) for c in (True, False)}
++    want = {(d, f, c): d and not (f and c) for d, f, c in table}
++    want = {k: bool(v) for k, v in want.items()}
++    finals = [n for n in ast.walk(tree) if isinstance(n, ast.Try) and n.finalbody]
++    cleared = any("self.buf.ple_staging" in ast.unparse(s) and "None" in ast.unparse(s) for t in finals
++                  for s in t.finalbody)
++    got = {k: bool(v) for k, v in table.items()}
++    return got == want and cleared, f"defers alone, never beside a shared prompt pass: {got == want}; cleared in " \
++        f"the forward's finally: {cleared}"
++
++
++def switch():
++    code = "from tensorfold.families.qwen4_exp.cuda import multi as m; print(m.PLE_DEFER)"
++    env = {k: v for k, v in os.environ.items() if k != "TENSORFOLD_PLE_DEFER"}
++    on = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True).stdout.strip()
++    off = subprocess.run([sys.executable, "-c", code], env={**env, "TENSORFOLD_PLE_DEFER": "0"},
++                         capture_output=True, text=True).stdout.strip()
++    return on == "True" and off == "False", f"default {on}, TENSORFOLD_PLE_DEFER=0 {off}"
++
++
++check("deferred: the n-gram layer stages the rows before its first kernel, the same bytes as stage would", deferred)
++check("no n-gram layer: nothing deferred", no_ple)
++check("the decode round defers alone, not beside a shared prompt pass, and clears it after its forward",
++      round_wiring)
++check("TENSORFOLD_PLE_DEFER=0 turns it off", switch)
++print("ALL PASS" if not fails else f"{fails} FAIL", flush=True)
++sys.exit(1 if fails else 0)
