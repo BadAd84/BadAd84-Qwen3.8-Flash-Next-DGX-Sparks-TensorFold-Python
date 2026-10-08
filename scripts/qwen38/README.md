@@ -86,10 +86,28 @@ changes: TensorFold PR #319 ported to the recipe's TensorFold v0.6.1, `ple-cache
   speeds come from the client side (time to the first token, then the rest of the reply).
 - `zig2_ab.sh <arm>` + `zig_sum.py`: the same comparison on TWO boxes (owner 2026-10-08), run: spark6 serves the Zig
   release (`~/qwen-zig`, its own `start.sh` and defaults) and spark4 keeps serving production; both boxes start
-  together, each measuring its own server, and `/health`'s request counter flags outside traffic on production.
-  `gpu_equiv.py` (copy bandwidth, bf16 matmul) and `gpu_clocks.sh` (idle CPU, clocks and power under that load)
-  measure how alike the two boxes are: copy bandwidth equal (241-245 GB/s), bf16 matmul spark6 ~97-99 against
-  spark4 ~89-92 TFLOPS with neither box busy at idle, so compute-bound prefill may favour spark6 by up to ~8%.
+  together, each measuring its own server, and `/health`'s request counter flags outside traffic on production (none
+  in any pass; the Zig server's `/health` has no counter, and spark6 has no clients). `gpu_equiv.py` (copy bandwidth,
+  bf16 matmul) and `gpu_clocks.sh` (idle CPU, clocks and power under that load) measure how alike the two boxes are:
+  copy bandwidth equal (241-245 GB/s), bf16 matmul spark6 ~97-99 against spark4 ~89-92 TFLOPS with neither box busy
+  at idle, so compute-bound prefill may favour spark6 by up to ~8%.
+- `prefill_fresh.py <arm>`: cold prefill with prompts new to the server (8k / 32k / 128k tokens, 3 each). zig2_ab.sh's
+  prefill prompts repeat every pass and the Zig server answers a repeated prompt from its cache (128k in 0.31 s), so
+  its prefill rows measure the cache, not prefill.
+
+Result (2026-10-08, thinking off, 512-token replies; decode = the median of 3 passes' medians, per request, client
+side; prefill = `prefill_fresh.py`, median of 3):
+
+| | production (spark4) | Zig release (spark6) | Zig / production |
+|---|---:|---:|---:|
+| code, 1 / 2 / 4 clients | 92.6 / 65.1 / 42.8 tok/s | 105.4 / 77.0 / 55.5 | 1.14 / 1.18 / 1.30 |
+| prose, 1 / 2 / 4 clients | 76.1 / 52.1 / 33.0 tok/s | 62.2 / 50.9 / 37.4 | 0.82 / 0.98 / 1.13 |
+| prefill 8k / 32k / 128k | 2,723 / 2,693 / 2,311 tok/s | 2,933 / 2,889 / 2,474 | 1.08 / 1.07 / 1.07 |
+
+The Zig release decodes code faster at every concurrency and prose faster at 4 clients, and is 18% slower on prose
+at one client. Its prefill lead (7-8%) is no larger than spark6's compute lead (bf16 matmul ~8%), so it shows no
+prefill gain of its own. Its pass medians spread more (code at one client 99.4-106.1, production 92.1-92.8). The
+checkpoints differ (INT4-AutoRound against MLX 4-bit), so the replies were not compared.
 
 Verify a rebuild before serving it: the golden replies must be byte-identical to the recipe's image (spark4
 `~/work/qf_harness.py golden` then `diff`), as they were for the image now serving.

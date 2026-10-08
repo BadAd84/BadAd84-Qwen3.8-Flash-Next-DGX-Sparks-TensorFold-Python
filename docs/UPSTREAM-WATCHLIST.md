@@ -19,8 +19,10 @@ Current state of the upstream recipe and engine against what spark4 runs. Live c
   both read is `nvidia/Qwen3.8-Flash-Next-NVFP4` (123.6 GiB); MiaAI-Lab's `nvfp4-v066` branch measured it on the
   Python engine v0.6.6: prose / code 35.2 / 52.1 tok/s at one request, prefill 1,479-1,616 tok/s, against 2,180-2,468
   for the MLX checkpoint (its 47.7 GiB FP8 n-gram table pages from disk).
-- The Zig release is staged on spark6 for the two-box comparison against spark4 (`scripts/qwen38/zig2_ab.sh`), and on
-  spark4 in `~/qwen-zig` (not serving).
+- The Zig release serves on spark6 for the two-box comparison against spark4 (`scripts/qwen38/zig2_ab.sh`; it is
+  also staged, not serving, in spark4's `~/qwen-zig`). Measured 2026-10-08 (`scripts/qwen38/README.md`): code decode
+  1.14-1.30x production at 1-4 clients, prose 0.82x at one client and 1.13x at four; fresh prefill 1.07-1.08x, which
+  spark6's ~8% compute lead accounts for.
 - TensorFold's Python engine is frozen at v0.6.6 (`python-0.6` branch); TensorFold's own 1.0.x release builds serve
   only Nemotron 3.5 on a GB10 (`capabilities --json`), so this recipe's Zig build is TensorFold's `zig-flashnext` line
   plus the recipe's patches.
